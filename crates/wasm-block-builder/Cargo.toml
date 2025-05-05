@@ -1,0 +1,46 @@
+[package]
+name = "wasm-block-builder"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/flashbots/rbuilder"
+repository = "https://github.com/flashbots/rbuilder"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1.0.210", features = ["derive", "alloc"], default-features = false }
+thiserror = { version = "1.0.64", default-features = false }
+
+hashbrown = { version = "0.14", default-features = false }
+
+alloy-primitives = { workspace = true, features = ["serde"] } # Inherit from workspace, add serde
+alloy-rlp.workspace = true
+
+revm = { workspace = true, features = [
+    "memory_limit", # Important for constrained environments
+    "serde", # Needed for state serialization if revm types are used directly
+    "hashbrown", # Ensure it uses hashbrown
+]}
+
+serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+log = { version = "0.4", default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[features]
+default = []
+tracing = [] # Keep tracing optional
+wamr = []
+
+[dev-dependencies]
+wasmer = { version = "6.0.0", features = ["wamr"] }
+wasmer-wasix = { version = "0.600.0", features = ["logging", "sys"] }
+
+tokio = { version = "1.44.1", features = ["full", "macros", "rt-multi-thread"] }
+
+serde_json = "1.0.128"
+
