@@ -1,5 +1,6 @@
 
 mod builder;
+mod crypto;
 mod evm;
 mod interfaces;
 mod state;
@@ -7,6 +8,10 @@ mod state;
 use interfaces::{deserialize_block_input, deserialize_state_input, deserialize_state_changes, serialize_output};
 use state::provider::WasiStateProvider;
 use thiserror::Error;
+
+// Import the interfaces WasiError for conversion
+use interfaces::WasiError as InterfacesWasiError;
+use crate::interfaces::serialize_output_without_signature;
 
 #[derive(Error, Debug)]
 pub enum WasiError {
@@ -22,6 +27,8 @@ pub enum WasiError {
     StateRoot(String),
     #[error("State Provider Error: {0}")]
     State(#[from] state::provider::StateError),
+    #[error("Crypto Error: {0}")]
+    Crypto(#[from] crypto::CryptoError),
     #[error("Invalid Input Pointer")]
     NullInputPtr,
     #[error("Invalid Output Pointer")]
@@ -31,6 +38,25 @@ pub enum WasiError {
 }
 
 type WasiResult<T> = Result<T, WasiError>;
+
+// Implement conversion from interfaces::WasiError to lib::WasiError
+impl From<InterfacesWasiError> for WasiError {
+    fn from(err: InterfacesWasiError) -> Self {
+        match err {
+            InterfacesWasiError::InputDeserialization(msg) => WasiError::InputDeserialization(msg),
+            InterfacesWasiError::OutputSerialization(msg) => WasiError::OutputSerialization(msg),
+            InterfacesWasiError::Builder(msg) => WasiError::InputDeserialization(format!("Builder error: {}", msg)),
+            InterfacesWasiError::Evm(msg) => WasiError::InputDeserialization(format!("EVM error: {}", msg)),
+            InterfacesWasiError::StateRoot(msg) => WasiError::StateRoot(msg),
+            InterfacesWasiError::State(msg) => WasiError::InputDeserialization(format!("State error: {}", msg)),
+            InterfacesWasiError::NullInputPtr => WasiError::NullInputPtr,
+            InterfacesWasiError::NullOutputPtr => WasiError::NullOutputPtr,
+            InterfacesWasiError::OutputBufferTooSmall { required, provided } => 
+                WasiError::OutputBufferTooSmall { required, provided },
+            InterfacesWasiError::Internal(msg) => WasiError::InputDeserialization(format!("Internal error: {}", msg)),
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn build_block(
@@ -53,6 +79,7 @@ pub extern "C" fn build_block(
                 WasiError::State(_) => -6,
                 WasiError::StateRoot(_) => -7,
                 WasiError::OutputSerialization(_) => -8,
+                WasiError::Crypto(_) => -9,
             }
         }
     }
@@ -106,10 +133,20 @@ fn process_build_block_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
         input_data.config,
     );
     
-    let output_data = builder
+    let mut output_data = builder
         .build_block(input_data.transactions, input_data.bundles)?;
+
+    log::info!("Signing block {}", output_data.header.number);
+
+    let signer = crypto::BlockSigner::new()?;
+
+    let data_to_sign = serialize_output_without_signature(&output_data)?;
+
+    let signature = signer.sign(&data_to_sign)?;
+
+    output_data.signature = Some(signature);
         
-    log::info!("Finished block build for block {}", output_data.header.number);
+    log::info!("Finished block build for block {} with signature", output_data.header.number);
 
     serialize_output(&output_data)
         .map_err(|e| WasiError::OutputSerialization(format!("Failed to serialize BlockBuilderOutput: {}", e)))
@@ -172,6 +209,7 @@ pub extern "C" fn get_module_info(
         api_version: u32,
         features: Vec<String>,
         supported_tx_types: Vec<String>,
+        security_features: Vec<String>,
     }
     
     impl serde::Serialize for ModuleInfo {
@@ -180,11 +218,12 @@ pub extern "C" fn get_module_info(
             S: serde::Serializer,
         {
             use serde::ser::SerializeMap;
-            let mut map = serializer.serialize_map(Some(4))?;
+            let mut map = serializer.serialize_map(Some(5))?;
             map.serialize_entry("version", &self.version)?;
             map.serialize_entry("api_version", &self.api_version)?;
             map.serialize_entry("features", &self.features)?;
             map.serialize_entry("supported_tx_types", &self.supported_tx_types)?;
+            map.serialize_entry("security_features", &self.security_features)?;
             map.end()
         }
     }
@@ -204,6 +243,9 @@ pub extern "C" fn get_module_info(
             "access_list".to_string(),
             "eip1559".to_string(),
             "blob".to_string(),
+        ],
+        security_features: vec![
+            "ecdsa_output_signing".to_string(),
         ],
     };
     

@@ -22,16 +22,16 @@
     "blob_count": 0,
     "blob_gas_used": 0,
     "block_value": "0x1319718a5000",
-    "build_time_us": 1391,
+    "build_time_us": 1962,
     "gas_used": 21000,
     "trace": {
-      "finalize_time_us": 20,
-      "ordering_time_us": 435,
+      "finalize_time_us": 34,
+      "ordering_time_us": 628,
       "orders_considered": 1,
       "orders_failed": 0,
       "orders_included": 1,
-      "root_hash_time_us": 42,
-      "sim_time_us": 882
+      "root_hash_time_us": 62,
+      "sim_time_us": 1220
     },
     "tx_count": 1
   },
@@ -44,22 +44,23 @@
       "tx_type": 0
     }
   ],
+  "signature": "0x8cb694301669856237e06b53d6a7755c59e5a0dee098135e6f01b6328839a1f84c9ac9b8834d583252755d0276fbb6851fb3b601df702da661ac151f018d574a",
   "state_diff": {
     "accounts": [
-      {
-        "address": "0x2222222222222222222222222222222222222222",
-        "new_balance": "0x58788cb94b1d80000",
-        "new_code_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
-        "new_nonce": 0,
-        "old_balance": null,
-        "old_code_hash": null,
-        "old_nonce": null
-      },
       {
         "address": "0x1111111111111111111111111111111111111111",
         "new_balance": "0x361a082d451e4db000",
         "new_code_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
         "new_nonce": 6,
+        "old_balance": null,
+        "old_code_hash": null,
+        "old_nonce": null
+      },
+      {
+        "address": "0x2222222222222222222222222222222222222222",
+        "new_balance": "0x58788cb94b1d80000",
+        "new_code_hash": "0xc5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        "new_nonce": 0,
         "old_balance": null,
         "old_code_hash": null,
         "old_nonce": null

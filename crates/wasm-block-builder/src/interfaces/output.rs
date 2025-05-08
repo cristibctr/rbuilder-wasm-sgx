@@ -105,6 +105,8 @@ pub struct BlockBuilderOutput {
     pub state_root: Option<B256>,
     
     pub metrics: BlockMetrics,
+    
+    pub signature: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

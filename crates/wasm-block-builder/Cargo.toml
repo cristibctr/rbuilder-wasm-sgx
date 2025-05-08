@@ -28,6 +28,10 @@ revm = { workspace = true, features = [
 serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
+k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+ecdsa = { version = "0.16", default-features = false }
+sha3 = { version = "0.10", default-features = false }
+
 log = { version = "0.4", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 

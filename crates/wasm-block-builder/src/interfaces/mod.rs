@@ -8,8 +8,9 @@ pub use input::{
     SerializedCode, SerializedStorage, SerializedTransaction, StateProviderInput,
 };
 pub use output::{
-    AccountDiff, BlockBuilderOutput, BlockMetrics, SerializedHeader, SerializedLog,
-    SerializedReceipt, SerializedStateDiff, StorageDiff,
+    AccountDiff, BlockBuilderOutput, BlockMetrics, SerializedBuildTrace, SerializedHeader, SerializedLog,
+    SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, StorageDiff, SerializedStorageDiff,
+    SerializedCodeDiff,
 };
 
 pub mod input;
@@ -86,5 +87,15 @@ pub fn deserialize_state_changes(data: &[u8]) -> Result<SerializedStateDiff, Was
 
 pub fn serialize_output(output: &BlockBuilderOutput) -> Result<Vec<u8>, WasiError> {
     serialize_json(output).map_err(|e| WasiError::OutputSerialization(e.to_string()))
+}
+
+
+pub fn serialize_output_without_signature(output: &BlockBuilderOutput) -> Result<Vec<u8>, WasiError> {
+    let mut output_clone = output.clone();
+    output_clone.signature = None;
+
+    serialize_json(&output_clone).map_err(|e| WasiError::OutputSerialization(
+        format!("Failed to serialize BlockBuilderOutput for signing: {}", e)
+    ))
 }
 

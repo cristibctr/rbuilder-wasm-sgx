@@ -420,6 +420,7 @@ impl WasiBlockBuilder {
             state_diff,
             state_root,
             metrics,
+            signature: None,
         })
     }
     
