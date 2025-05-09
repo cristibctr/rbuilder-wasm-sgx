@@ -89,6 +89,7 @@ impl TryFrom<wamr_sgx_val_t> for Value {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct WasmModule {
     module: *mut WamrSgxModule,
     instance: *mut WamrSgxInstance,
@@ -734,6 +735,7 @@ impl Drop for WasmModule {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct BlockBuilderSgx {
     module: WasmModule,
 }
@@ -750,7 +752,188 @@ impl Default for wamr_sgx_val_t {
 impl BlockBuilderSgx {
     pub fn new<P: AsRef<Path>>(wasm_path: P) -> Result<Self, Error> {
         let module = WasmModule::new(wasm_path)?;
+        let module_info = Self::get_module_info_internal(&module)?;
+        
+        log::info!("SGX WASM module initialized successfully");
+        log::debug!("Module info: {}", module_info);
+        
         Ok(Self { module })
+    }
+    fn get_module_info_internal(module: &WasmModule) -> Result<String, Error> {
+        let output_size = 4096;
+        let alloc_args = vec![Value::I32(output_size as i32)];
+        let alloc_result = module.call_function("wbm_alloc", &alloc_args)?;
+        
+        let output_ptr = match &alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string())),
+        };
+        let len_alloc_args = vec![Value::I32(4)];
+        let len_alloc_result = module.call_function("wbm_alloc", &len_alloc_args)?;
+        
+        let len_ptr = match &len_alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = module.call_function("wbm_free", &free_output_args);
+                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+            }
+        };
+        module.write_memory(len_ptr, &(output_size as u32).to_le_bytes())?;
+        let get_info_args = vec![
+            Value::I32(output_ptr as i32),
+            Value::I32(len_ptr as i32),
+        ];
+        
+        let info_result = module.call_function("get_module_info", &get_info_args)?;
+        
+        let result_code = match &info_result[0] {
+            Value::I32(code) => *code,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = module.call_function("wbm_free", &free_len_args);
+                return Err(Error::InvalidArgument("Invalid result code from get_module_info".to_string()));
+            }
+        };
+        
+        if result_code != 0 {
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+            let _ = module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = module.call_function("wbm_free", &free_len_args)?;
+            
+            return Err(Error::FunctionCallFailed(result_code));
+        }
+        let len_data = module.read_memory(len_ptr, 4)?;
+        let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+        let data = module.read_memory(output_ptr, output_len)?;
+        let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+        let _ = module.call_function("wbm_free", &free_output_args)?;
+        let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+        let _ = module.call_function("wbm_free", &free_len_args)?;
+        let info = String::from_utf8(data)
+            .map_err(|_| Error::InvalidArgument("Module info is not valid UTF-8".to_string()))?;
+        
+        Ok(info)
+    }
+    pub fn get_public_key(&self) -> Result<String, Error> {
+        println!("[SGX] Getting public key from enclave");
+        let buffer_size = 256;
+        let alloc_args = vec![Value::I32(buffer_size as i32)];
+        let alloc_result = self.module.call_function("wbm_alloc", &alloc_args)?;
+        
+        let output_ptr = match &alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string())),
+        };
+        let len_alloc_args = vec![Value::I32(4)];
+        let len_alloc_result = self.module.call_function("wbm_alloc", &len_alloc_args)?;
+        
+        let len_ptr = match &len_alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+            }
+        };
+        self.module.write_memory(len_ptr, &(buffer_size as u32).to_le_bytes())?;
+        let get_pk_args = vec![
+            Value::I32(output_ptr as i32),
+            Value::I32(len_ptr as i32),
+        ];
+        
+        let pk_result = self.module.call_function("get_public_key", &get_pk_args)?;
+        
+        let result_code = match &pk_result[0] {
+            Value::I32(code) => *code,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                println!("Invalid result code from get_public_key");
+                return Err(Error::InvalidArgument("Invalid result code from get_public_key".to_string()));
+            }
+        };
+        
+        if result_code == -2 {
+            let len_data = self.module.read_memory(len_ptr, 4)?;
+            let required_size = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+            
+            println!("[SGX] Public key buffer too small, need {} bytes", required_size);
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let new_alloc_args = vec![Value::I32(required_size as i32)];
+            let new_alloc_result = self.module.call_function("wbm_alloc", &new_alloc_args)?;
+            
+            let new_output_ptr = match &new_alloc_result[0] {
+                Value::I32(ptr) => *ptr as u32,
+                _ => {
+                    let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                    let _ = self.module.call_function("wbm_free", &free_len_args);
+                    return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                }
+            };
+            self.module.write_memory(len_ptr, &required_size.to_le_bytes())?;
+            let new_get_pk_args = vec![
+                Value::I32(new_output_ptr as i32),
+                Value::I32(len_ptr as i32),
+            ];
+            
+            let new_pk_result = self.module.call_function("get_public_key", &new_get_pk_args)?;
+            
+            let new_result_code = match &new_pk_result[0] {
+                Value::I32(code) => *code,
+                _ => {
+                    let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+                    let _ = self.module.call_function("wbm_free", &free_output_args);
+                    let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                    let _ = self.module.call_function("wbm_free", &free_len_args);
+                    return Err(Error::InvalidArgument("Invalid result code from get_public_key".to_string()));
+                }
+            };
+            
+            if new_result_code != 0 {
+                let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args)?;
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args)?;
+                
+                return Err(Error::FunctionCallFailed(new_result_code));
+            }
+            let len_data = self.module.read_memory(len_ptr, 4)?;
+            let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+            
+            let key_data = self.module.read_memory(new_output_ptr, output_len)?;
+            let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            String::from_utf8(key_data)
+                .map_err(|_| Error::InvalidArgument("Public key data is not valid UTF-8".to_string()))
+            
+        } else if result_code != 0 {
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            
+            return Err(Error::FunctionCallFailed(result_code));
+        } else {
+            let len_data = self.module.read_memory(len_ptr, 4)?;
+            let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+            
+            let key_data = self.module.read_memory(output_ptr, output_len)?;
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            String::from_utf8(key_data)
+                .map_err(|_| Error::InvalidArgument("Public key data is not valid UTF-8".to_string()))
+        }
     }
     
     pub fn build_block(&self, input_json: &str) -> Result<String, Error> {

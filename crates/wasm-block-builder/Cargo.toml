@@ -16,7 +16,7 @@ thiserror = { version = "1.0.64", default-features = false }
 
 hashbrown = { version = "0.14", default-features = false }
 
-alloy-primitives = { workspace = true, features = ["serde"] } # Inherit from workspace, add serde
+alloy-primitives = { workspace = true, features = ["serde", "rand"] } # Inherit from workspace, add serde
 alloy-rlp.workspace = true
 
 revm = { workspace = true, features = [
@@ -28,9 +28,10 @@ revm = { workspace = true, features = [
 serde_json = { version = "1.0.128", default-features = false, features = ["alloc"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 ecdsa = { version = "0.16", default-features = false }
 sha3 = { version = "0.10", default-features = false }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 
 log = { version = "0.4", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -39,6 +40,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 default = []
 tracing = [] # Keep tracing optional
 wamr = []
+test-key = []
 
 [dev-dependencies]
 wasmer = { version = "6.0.0", features = ["wamr"] }

@@ -3,6 +3,8 @@ pub mod block_building_helper;
 pub mod mock_block_building_helper;
 pub mod ordering_builder;
 pub mod parallel_builder;
+#[cfg(feature = "sgx_integration")]
+pub mod sgx_wasm_builder;
 
 use crate::{
     building::{BlockBuildingContext, BuiltBlockTrace, SimulatedOrderSink},

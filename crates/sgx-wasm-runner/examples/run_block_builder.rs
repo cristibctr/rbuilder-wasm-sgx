@@ -211,6 +211,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     
+    println!("\nGetting public key from SGX enclave...");
+    match block_builder.get_public_key() {
+        Ok(key) => {
+            println!("Public key: {}", key);
+            println!("This key will be used to verify block signatures");
+        },
+        Err(err) => {
+            println!("Failed to get public key: {}", err);
+            return Err(to_boxed_error(AppError::from(err)));
+        }
+    }
+    
     println!("\nBuilding block inside SGX enclave...");
     
     let input_json = match serde_json::to_string(&sample_input) {

@@ -7,6 +7,7 @@ pub mod fmt;
 mod noncer;
 mod provider_factory_reopen;
 pub mod reconnect;
+pub mod sgx_signature_verifier;
 mod test_data_generator;
 mod tx_signer;
 

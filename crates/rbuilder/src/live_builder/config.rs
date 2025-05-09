@@ -1,6 +1,7 @@
 //! Config should always be deserializable, default values should be used
 //!
 //!
+use tracing::{error, debug};
 use super::{
     base_config::BaseConfig,
     block_output::{
@@ -14,35 +15,26 @@ use super::{
         relay_submit::{OptimisticConfig, RelaySubmitSinkFactory, SubmissionConfig},
     },
 };
-use crate::{
-    beacon_api_client::Client,
-    building::{
-        builders::{
-            ordering_builder::{OrderingBuilderConfig, OrderingBuildingAlgorithm},
-            parallel_builder::{
-                parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
-            },
-            BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
+use crate::{beacon_api_client::Client, building::{
+    builders::{
+        ordering_builder::{OrderingBuilderConfig, OrderingBuildingAlgorithm},
+        parallel_builder::{
+            parallel_build_backtest, ParallelBuilderConfig, ParallelBuildingAlgorithm,
         },
-        order_priority::{
-            OrderLengthThreeMaxProfitPriority, OrderLengthThreeMevGasPricePriority,
-            OrderMaxProfitPriority, OrderMevGasPricePriority, OrderTypePriority,
-        },
-        Sorting,
+        BacktestSimulateBlockInput, Block, BlockBuildingAlgorithm,
     },
-    live_builder::{
-        base_config::EnvOrValue, block_output::relay_submit::BuilderSinkFactory,
-        cli::LiveBuilderConfig, payload_events::MevBoostSlotDataGenerator,
+    order_priority::{
+        OrderLengthThreeMaxProfitPriority, OrderLengthThreeMevGasPricePriority,
+        OrderMaxProfitPriority, OrderMevGasPricePriority, OrderTypePriority,
     },
-    mev_boost::{BLSBlockSigner, RelayClient},
-    primitives::mev_boost::{
-        MevBoostRelayBidSubmitter, MevBoostRelaySlotInfoProvider, RelayConfig, RelayMode,
-        RelaySubmitConfig,
-    },
-    provider::StateProviderFactory,
-    roothash::RootHashContext,
-    utils::{build_info::rbuilder_version, ProviderFactoryReopener, Signer},
-};
+    Sorting,
+}, live_builder::{
+    base_config::EnvOrValue, block_output::relay_submit::BuilderSinkFactory,
+    cli::LiveBuilderConfig, payload_events::MevBoostSlotDataGenerator,
+}, mev_boost::{BLSBlockSigner, RelayClient}, primitives::mev_boost::{
+    MevBoostRelayBidSubmitter, MevBoostRelaySlotInfoProvider, RelayConfig, RelayMode,
+    RelaySubmitConfig,
+}, provider, provider::StateProviderFactory, roothash::RootHashContext, utils::{build_info::rbuilder_version, ProviderFactoryReopener, Signer}};
 use alloy_chains::ChainKind;
 use alloy_primitives::{
     utils::{format_ether, parse_ether},
@@ -64,13 +56,7 @@ use reth_provider::StaticFileProviderFactory;
 use serde::Deserialize;
 use serde_with::{serde_as, OneOrMany};
 use std::collections::HashMap;
-use std::{
-    fmt::Debug,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-    time::Duration,
-};
+use std::{env, fmt::Debug, path::{Path, PathBuf}, str::FromStr, sync::Arc, time::Duration};
 use tracing::{info, warn};
 use url::Url;
 
@@ -85,6 +71,21 @@ pub const DEFAULT_MAX_CONCURRENT_SEALS: u64 = 1;
 pub enum SpecificBuilderConfig {
     ParallelBuilder(ParallelBuilderConfig),
     OrderingBuilder(OrderingBuilderConfig),
+    #[cfg(feature = "sgx_integration")]
+    SgxWasmBuilder(SgxWasmBuilderConfig),
+}
+
+#[cfg(feature = "sgx_integration")]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct SgxWasmBuilderConfig {
+    pub wasm_path: PathBuf,
+    #[serde(default = "default_fallback_to_native")]
+    pub fallback_to_native: bool,
+}
+
+#[cfg(feature = "sgx_integration")]
+fn default_fallback_to_native() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -445,6 +446,35 @@ impl LiveBuilderConfig for Config {
             },
             SpecificBuilderConfig::ParallelBuilder(config) => {
                 parallel_build_backtest::<P>(input, config)
+            },
+            #[cfg(feature = "sgx_integration")]
+            SpecificBuilderConfig::SgxWasmBuilder(config) => {
+                use crate::backtest::sgx_wasm_adapter::SgxWasmBacktestAdapter;
+                use reth_node_api::FullNodeComponents;
+
+                info!("Using SGX WASM adapter for backtest");
+
+                let adapter = SgxWasmBacktestAdapter::new(config.wasm_path)?;
+
+                info!("Created SGX WASM backtest adapter with public key: {}", adapter.get_public_key());
+
+                let cached_reads = input.cached_reads.as_ref().cloned().unwrap_or_default();
+
+                let result = adapter.build_block_with_provider(&input)?;
+
+                info!("Backtest block built with value: {}", result.winning_bid_value);
+
+                let sealed_block = reth::primitives::SealedBlock::default();
+
+                let block = Block {
+                    trace: crate::building::BuiltBlockTrace::default(),
+                    sealed_block,
+                    txs_blobs_sidecars: Vec::new(),
+                    execution_requests: Vec::new(),
+                    builder_name: "SGX WASM Builder".to_string(),
+                };
+
+                Ok((block, cached_reads))
             }
         }
     }
@@ -470,74 +500,89 @@ impl Config {
 
 impl Default for Config {
     fn default() -> Self {
+        let mut builders = vec![
+            BuilderConfig {
+                name: "mgp-ordering".to_string(),
+                builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                    discard_txs: true,
+                    sorting: Sorting::MevGasPrice,
+                    failed_order_retries: 1,
+                    drop_failed_orders: true,
+                    coinbase_payment: false,
+                    build_duration_deadline_ms: None,
+                }),
+            },
+            BuilderConfig {
+                name: "mp-ordering".to_string(),
+                builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                    discard_txs: true,
+                    sorting: Sorting::MaxProfit,
+                    failed_order_retries: 1,
+                    drop_failed_orders: true,
+                    coinbase_payment: false,
+                    build_duration_deadline_ms: None,
+                }),
+            },
+            BuilderConfig {
+                name: String::from("mp-ordering-deadline"),
+                builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                    discard_txs: true,
+                    sorting: Sorting::MaxProfit,
+                    failed_order_retries: 1,
+                    drop_failed_orders: true,
+                    coinbase_payment: false,
+                    build_duration_deadline_ms: Some(30),
+                }),
+            },
+            BuilderConfig {
+                name: String::from("mp-ordering-cb"),
+                builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                    discard_txs: true,
+                    sorting: Sorting::MaxProfit,
+                    failed_order_retries: 1,
+                    drop_failed_orders: true,
+                    coinbase_payment: true,
+                    build_duration_deadline_ms: None,
+                }),
+            },
+            BuilderConfig {
+                name: String::from("mgp-ordering-default"),
+                builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
+                    discard_txs: true,
+                    sorting: Sorting::MevGasPrice,
+                    failed_order_retries: 1,
+                    drop_failed_orders: false,
+                    coinbase_payment: false,
+                    build_duration_deadline_ms: None,
+                }),
+            },
+            BuilderConfig {
+                name: String::from("parallel"),
+                builder: SpecificBuilderConfig::ParallelBuilder(ParallelBuilderConfig {
+                    discard_txs: true,
+                    num_threads: 25,
+                    coinbase_payment: false,
+                }),
+            },
+        ];
+        #[cfg(feature = "sgx_integration")]
+        {
+            let workspace_dir = env::var("CARGO_WORKSPACE_DIR").unwrap_or_else(|_| "../".into());
+            let wasm_path = Path::new(&workspace_dir)
+                .join("target/wasm32-wasip1/release/wasm_block_builder.wasm");
+            builders.push(BuilderConfig {
+                name: String::from("sgx-wasm"),
+                builder: SpecificBuilderConfig::SgxWasmBuilder(SgxWasmBuilderConfig {
+                    wasm_path,
+                    fallback_to_native: true,
+                }),
+            });
+        }
+        
         Self {
             base_config: Default::default(),
             l1_config: Default::default(),
-            builders: vec![
-                BuilderConfig {
-                    name: "mgp-ordering".to_string(),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MevGasPrice,
-                        failed_order_retries: 1,
-                        drop_failed_orders: true,
-                        coinbase_payment: false,
-                        build_duration_deadline_ms: None,
-                    }),
-                },
-                BuilderConfig {
-                    name: "mp-ordering".to_string(),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MaxProfit,
-                        failed_order_retries: 1,
-                        drop_failed_orders: true,
-                        coinbase_payment: false,
-                        build_duration_deadline_ms: None,
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("mp-ordering-deadline"),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MaxProfit,
-                        failed_order_retries: 1,
-                        drop_failed_orders: true,
-                        coinbase_payment: false,
-                        build_duration_deadline_ms: Some(30),
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("mp-ordering-cb"),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MaxProfit,
-                        failed_order_retries: 1,
-                        drop_failed_orders: true,
-                        coinbase_payment: true,
-                        build_duration_deadline_ms: None,
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("mgp-ordering-default"),
-                    builder: SpecificBuilderConfig::OrderingBuilder(OrderingBuilderConfig {
-                        discard_txs: true,
-                        sorting: Sorting::MevGasPrice,
-                        failed_order_retries: 1,
-                        drop_failed_orders: false,
-                        coinbase_payment: false,
-                        build_duration_deadline_ms: None,
-                    }),
-                },
-                BuilderConfig {
-                    name: String::from("parallel"),
-                    builder: SpecificBuilderConfig::ParallelBuilder(ParallelBuilderConfig {
-                        discard_txs: true,
-                        num_threads: 25,
-                        coinbase_payment: false,
-                    }),
-                },
-            ],
+            builders,
         }
     }
 }
@@ -594,14 +639,14 @@ pub fn coinbase_signer_from_secret_key(secret_key: &str) -> eyre::Result<Signer>
 
 pub fn create_builders<P>(configs: Vec<BuilderConfig>) -> Vec<Arc<dyn BlockBuildingAlgorithm<P>>>
 where
-    P: StateProviderFactory + Clone + 'static,
+    P: provider::StateProviderFactory + Clone + 'static,
 {
     configs.into_iter().map(|cfg| create_builder(cfg)).collect()
 }
 
 fn create_builder<P>(cfg: BuilderConfig) -> Arc<dyn BlockBuildingAlgorithm<P>>
 where
-    P: StateProviderFactory + Clone + 'static,
+    P: provider::StateProviderFactory + Clone + 'static,
 {
     match cfg.builder {
         SpecificBuilderConfig::OrderingBuilder(order_cfg) => match order_cfg.sorting {
@@ -623,6 +668,46 @@ where
         },
         SpecificBuilderConfig::ParallelBuilder(parallel_cfg) => {
             Arc::new(ParallelBuildingAlgorithm::new(parallel_cfg, cfg.name))
+        },
+        #[cfg(feature = "sgx_integration")]
+        SpecificBuilderConfig::SgxWasmBuilder(sgx_cfg) => {
+            use crate::building::builders::sgx_wasm_builder::SgxWasmBlockBuildingAlgorithm;
+            
+            match SgxWasmBlockBuildingAlgorithm::new(sgx_cfg.wasm_path.clone(), sgx_cfg.fallback_to_native) {
+                Ok(builder) => {
+                    info!("SGX WASM block builder initialized successfully");
+                    Arc::new(builder)
+                },
+                Err(e) => {
+                    error!("Failed to initialize SGX WASM block builder: {}", e);
+                    if sgx_cfg.fallback_to_native {
+                        warn!("Falling back to ordering builder with max profit sorting");
+                        let fallback_cfg = OrderingBuilderConfig {
+                            discard_txs: true,
+                            sorting: Sorting::MaxProfit,
+                            failed_order_retries: 1,
+                            drop_failed_orders: true,
+                            coinbase_payment: false,
+                            build_duration_deadline_ms: None,
+                        };
+                        Arc::new(OrderingBuildingAlgorithm::<OrderMaxProfitPriority>::new(
+                            fallback_cfg,
+                            format!("{}-fallback", cfg.name),
+                        ))
+                    } else {
+                        let builder = SgxWasmBlockBuildingAlgorithm::new(
+                            sgx_cfg.wasm_path,
+                            false,
+                        ).unwrap_or_else(|_| {
+                            SgxWasmBlockBuildingAlgorithm::new(
+                                PathBuf::from("/nonexistent"),
+                                false,
+                            ).expect("This should never fail")
+                        });
+                        Arc::new(builder)
+                    }
+                }
+            }
         }
     }
 }

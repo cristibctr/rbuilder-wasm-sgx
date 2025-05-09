@@ -164,7 +164,7 @@ impl Bundle {
         bundle_nonces(txs)
     }
 
-    fn list_txs(&self) -> Vec<(&TransactionSignedEcRecoveredWithBlobs, bool)> {
+    pub fn list_txs(&self) -> Vec<(&TransactionSignedEcRecoveredWithBlobs, bool)> {
         self.txs
             .iter()
             .map(|tx| (tx, self.is_tx_optional(&tx.hash())))

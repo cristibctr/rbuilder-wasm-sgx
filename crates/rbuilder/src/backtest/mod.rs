@@ -6,6 +6,7 @@ pub mod build_block;
 pub mod redistribute;
 pub mod restore_landed_orders;
 mod results_store;
+pub mod sgx_wasm_adapter;
 mod store;
 
 use ahash::HashMap;

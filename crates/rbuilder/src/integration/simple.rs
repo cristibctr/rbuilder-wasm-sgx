@@ -47,7 +47,7 @@ mod tests {
     #[tokio::test]
     async fn test_simple_example() {
         let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../crates/rbuilder/src/integration/test_data/config-playground.toml");
+            .join("../../config-wasm-playground.toml");
 
         // This test sends a transaction ONLY to the builder and waits for the block to be built with it.
         let srv = Playground::new("test_simple_example", &config_path).unwrap();

@@ -19,6 +19,11 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 eyre.workspace = true
 thiserror.workspace = true
+sgx-wasm-runner = { path = "../sgx-wasm-runner", optional = true }
+k256 = { version = "0.13", features = ["ecdsa"], optional = true }
+ecdsa = { version = "0.16", optional = true }
+sha3 = { version = "0.10", optional = true }
+hex = { version = "0.4", optional = true }
 reth.workspace = true
 reth-db.workspace = true
 reth-db-common.workspace = true
@@ -36,6 +41,7 @@ reth-provider.workspace = true
 reth-chainspec.workspace = true
 reth-evm.workspace = true
 reth-evm-ethereum.workspace = true
+reth-transaction-pool.workspace = true
 revm.workspace = true
 revm-primitives.workspace = true
 revm-inspectors.workspace = true
@@ -153,6 +159,16 @@ optimism = [
     "revm/optimism",
 ]
 redact-sensitive = []
+sgx_integration = [
+    "sgx-wasm-runner",
+    "k256",
+    "ecdsa",
+    "sha3",
+    "hex",
+]
+sgx_tests = [
+    "sgx_integration",
+]
 
 [[bench]]
 name = "bench_main"

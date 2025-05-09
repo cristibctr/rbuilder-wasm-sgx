@@ -210,6 +210,7 @@ pub extern "C" fn get_module_info(
         features: Vec<String>,
         supported_tx_types: Vec<String>,
         security_features: Vec<String>,
+        public_key: Option<String>,
     }
     
     impl serde::Serialize for ModuleInfo {
@@ -218,15 +219,24 @@ pub extern "C" fn get_module_info(
             S: serde::Serializer,
         {
             use serde::ser::SerializeMap;
-            let mut map = serializer.serialize_map(Some(5))?;
+            let mut map = serializer.serialize_map(Some(6))?;
             map.serialize_entry("version", &self.version)?;
             map.serialize_entry("api_version", &self.api_version)?;
             map.serialize_entry("features", &self.features)?;
             map.serialize_entry("supported_tx_types", &self.supported_tx_types)?;
             map.serialize_entry("security_features", &self.security_features)?;
+            map.serialize_entry("public_key", &self.public_key)?;
             map.end()
         }
     }
+
+    let public_key = match crypto::export_public_key_hex() {
+        Ok(key) => Some(key),
+        Err(e) => {
+            log::warn!("Failed to get public key: {}", e);
+            None
+        }
+    };
     
     let info = ModuleInfo {
         version: "0.1.0".to_string(),
@@ -246,7 +256,9 @@ pub extern "C" fn get_module_info(
         ],
         security_features: vec![
             "ecdsa_output_signing".to_string(),
+            "secure_key_management".to_string(),
         ],
+        public_key,
     };
     
     match serde_json::to_vec(&info) {
@@ -269,6 +281,36 @@ pub extern "C" fn get_module_info(
                 *output_len_ptr = required_len;
             }
             
+            0
+        },
+        Err(_) => -3,
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn get_public_key(
+    output_ptr: *mut u8,
+    output_len_ptr: *mut usize
+) -> i32 {
+    if output_ptr.is_null() || output_len_ptr.is_null() {
+        return -1;
+    }
+
+    match crypto::export_public_key_hex() {
+        Ok(key) => {
+            let key_bytes = key.as_bytes();
+            unsafe {
+                let provided_len = *output_len_ptr;
+                let required_len = key_bytes.len();
+                
+                if required_len > provided_len {
+                    *output_len_ptr = required_len;
+                    return -2;
+                }
+                
+                std::ptr::copy_nonoverlapping(key_bytes.as_ptr(), output_ptr, required_len);
+                *output_len_ptr = required_len;
+            }
             0
         },
         Err(_) => -3,
