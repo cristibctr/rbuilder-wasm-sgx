@@ -8,6 +8,13 @@ mod state;
 use interfaces::{deserialize_block_input, deserialize_state_input, deserialize_state_changes, serialize_output};
 use state::provider::WasiStateProvider;
 use thiserror::Error;
+use std::sync::{Arc, Mutex, Once};
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref LAST_SIMULATOR: Mutex<Option<Arc<builder::WasiSimulator>>> = Mutex::new(None);
+    static ref SIMULATOR_INIT: Once = Once::new();
+}
 
 // Import the interfaces WasiError for conversion
 use interfaces::WasiError as InterfacesWasiError;
@@ -129,12 +136,23 @@ fn process_build_block_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
     
     let mut builder = builder::WasiBlockBuilder::new(
         state_provider,
-        input_data.block_params,
-        input_data.config,
+        input_data.block_params.clone(),
+        input_data.config.clone(),
     );
     
     let mut output_data = builder
         .build_block(input_data.transactions, input_data.bundles)?;
+
+    if output_data.chunk_info.is_some() && output_data.build_id.is_some() {
+        let simulator_ref = Arc::new((*builder.simulator()).clone());
+
+        if let Ok(mut guard) = LAST_SIMULATOR.lock() {
+            *guard = Some(simulator_ref.clone());
+            log::info!("Stored simulator instance for build ID: {}", output_data.build_id.as_ref().unwrap());
+        } else {
+            log::warn!("Failed to store simulator instance for chunk retrieval");
+        }
+    }
 
     log::info!("Signing block {}", output_data.header.number);
 
@@ -315,6 +333,77 @@ pub extern "C" fn get_public_key(
         },
         Err(_) => -3,
     }
+}
+
+#[no_mangle]
+pub extern "C" fn get_state_diff_chunk(
+    chunk_id: u32,
+    build_id_ptr: *const u8,
+    build_id_len: usize,
+    output_ptr: *mut u8,
+    output_len_ptr: *mut usize
+) -> i32 {
+    match process_get_state_diff_chunk_safe(chunk_id, build_id_ptr, build_id_len, output_ptr, output_len_ptr) {
+        Ok(_) => 0,
+        Err(e) => {
+            log::error!("get_state_diff_chunk failed: {}", e);
+            match e {
+                WasiError::NullInputPtr => -1,
+                WasiError::NullOutputPtr => -1,
+                WasiError::OutputBufferTooSmall { .. } => -2,
+                WasiError::InputDeserialization(_) => -3,
+                WasiError::OutputSerialization(_) => -4,
+                _ => -99,
+            }
+        }
+    }
+}
+
+fn process_get_state_diff_chunk_safe(
+    chunk_id: u32,
+    build_id_ptr: *const u8,
+    build_id_len: usize,
+    output_ptr: *mut u8,
+    output_len_ptr: *mut usize
+) -> WasiResult<()> {
+    if build_id_ptr.is_null() { return Err(WasiError::NullInputPtr); }
+    if output_ptr.is_null() || output_len_ptr.is_null() { return Err(WasiError::NullOutputPtr); }
+    
+    let build_id_slice = unsafe { std::slice::from_raw_parts(build_id_ptr, build_id_len) };
+    let build_id = std::str::from_utf8(build_id_slice)
+        .map_err(|e| WasiError::InputDeserialization(format!("Invalid build ID string: {}", e)))?;
+    
+    let simulator = match LAST_SIMULATOR.lock() {
+        Ok(guard) => guard,
+        Err(e) => return Err(WasiError::InputDeserialization(format!("Failed to acquire simulator lock: {}", e))),
+    };
+    
+    if simulator.is_none() {
+        return Err(WasiError::InputDeserialization("No previous build found".to_string()));
+    }
+    
+    let chunk = match simulator.as_ref().unwrap().get_state_diff_chunk(build_id, chunk_id) {
+        Some(chunk) => chunk,
+        None => return Err(WasiError::InputDeserialization(format!("Chunk ID {} not found for build ID {}", chunk_id, build_id))),
+    };
+    
+    let chunk_json = serde_json::to_vec(&chunk)
+        .map_err(|e| WasiError::OutputSerialization(format!("Failed to serialize chunk: {}", e)))?;
+    
+    unsafe {
+        let provided_len = *output_len_ptr;
+        let required_len = chunk_json.len();
+        
+        if required_len > provided_len {
+            *output_len_ptr = required_len;
+            return Err(WasiError::OutputBufferTooSmall { required: required_len, provided: provided_len });
+        }
+        
+        std::ptr::copy_nonoverlapping(chunk_json.as_ptr(), output_ptr, required_len);
+        *output_len_ptr = required_len;
+    }
+    
+    Ok(())
 }
 
 

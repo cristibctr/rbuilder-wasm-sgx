@@ -1,4 +1,3 @@
-
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -6,6 +5,26 @@ use std::sync::Once;
 use std::io;
 use std::ptr;
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use log::{debug, error, warn};
+
+lazy_static::lazy_static! {
+    static ref METRICS: Mutex<HashMap<String, AtomicU64>> = Mutex::new(HashMap::new());
+}
+
+fn metrics_inc_counter(name: &str, value: u64) {
+    let mut metrics = METRICS.lock().unwrap_or_else(|e| {
+        error!("[SGX Metrics] Failed to lock metrics: {}", e);
+        return e.into_inner();
+    });
+    
+    metrics
+        .entry(name.to_string())
+        .or_insert_with(|| AtomicU64::new(0))
+        .fetch_add(value, Ordering::Relaxed);
+}
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -98,73 +117,85 @@ pub struct WasmModule {
 unsafe impl Send for WasmModule {}
 unsafe impl Sync for WasmModule {}
 
+impl Drop for WasmModule {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.instance.is_null() {
+                debug!("[SGX Cleanup] Destroying WASM instance: {:p}", self.instance);
+                wamr_sgx_destroy_instance(SGX_CONTEXT, self.instance);
+                self.instance = std::ptr::null_mut();
+            }
+            
+            if !self.module.is_null() {
+                debug!("[SGX Cleanup] Unloading WASM module: {:p}", self.module);
+                wamr_sgx_unload_module(SGX_CONTEXT, self.module);
+                self.module = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
 impl WasmModule {
     pub fn new<P: AsRef<Path>>(wasm_path: P) -> Result<Self, Error> {
         INIT.call_once(|| {
             unsafe {
                 match env::current_dir() {
-                    Ok(path) => println!("[SGX Init] Current working directory: {}", path.display()),
-                    Err(e) => println!("[SGX Init] Failed to get current directory: {}", e),
+                    Ok(path) => debug!("[SGX Init] Current working directory: {}", path.display()),
+                    Err(e) => error!("[SGX Init] Failed to get current directory: {}", e),
                 }
                 
                 let enclave_path = match env::var("WAMR_ENCLAVE_PATH") {
                     Ok(path) => {
-                        println!("[SGX Init] WAMR_ENCLAVE_PATH environment variable: {}", path);
-                        println!("[SGX Init] Using enclave path from environment: {}", path);
+                        debug!("[SGX Init] WAMR_ENCLAVE_PATH environment variable: {}", path);
+                        debug!("[SGX Init] Using enclave path from environment: {}", path);
                         
                         if Path::new(&path).exists() {
-                            println!("[SGX Init] Enclave file exists at: {}", path);
+                            debug!("[SGX Init] Enclave file exists at: {}", path);
                         } else {
-                            println!("[SGX Init] WARNING: Enclave file does not exist at: {}", path);
+                            error!("[SGX Init] WARNING: Enclave file does not exist at: {}", path);
                         }
                         
                         Some(path)
                     },
                     Err(_) => {
-                        println!("[SGX Init] WAMR_ENCLAVE_PATH not set, using default paths");
+                        error!("[SGX Init] WAMR_ENCLAVE_PATH not set, using default paths");
                         None
                     }
                 };
                 
                 if let Some(path) = enclave_path {
-                    println!("[SGX Init] Attempting to load enclave from: {}", path);
+                    debug!("[SGX Init] Attempting to load enclave from: {}", path);
                 }
                 
                 let mut ctx = ptr::null_mut();
                 let result = wamr_sgx_init(&mut ctx);
-                println!("[SGX Init] sgx_create_enclave returned: {} (0x{:x})", result, result);
+                debug!("[SGX Init] sgx_create_enclave returned: {} (0x{:x})", result, result);
                 
                 if result == 0 {
                     SGX_CONTEXT = ctx;
-                    println!("[SGX Init] Enclave created successfully with ID: {}", ctx as u64);
+                    debug!("[SGX Init] Enclave created successfully with ID: {}", ctx as u64);
                 } else {
-                    eprintln!("[SGX Init] Failed to initialize SGX context: error {} (0x{:x})", result, result);
+                    error!("[SGX Init] Failed to initialize SGX context: error {} (0x{:x})", result, result);
                 }
             }
         });
         
         if unsafe { SGX_CONTEXT.is_null() } {
-            println!("[SGX Error] SGX context is null after initialization");
+            error!("[SGX Error] SGX context is null after initialization");
             return Err(Error::SgxInitFailed(-1));
-        } else {
-            println!("[SGX] SGX context initialized successfully: {:p}", unsafe { SGX_CONTEXT });
         }
         
-        println!("[SGX] Reading WASM file from: {}", wasm_path.as_ref().display());
         let wasm_bytes = match std::fs::read(wasm_path.as_ref()) {
             Ok(bytes) => {
-                println!("[SGX] WASM file read successfully, size: {} bytes", bytes.len());
                 bytes
             },
             Err(e) => {
-                println!("[SGX Error] Failed to read WASM file: {}", e);
+                error!("[SGX Error] Failed to read WASM file: {}", e);
+                error!("[SGX Error] File exists check: {}", wasm_path.as_ref().exists());
                 return Err(Error::IoError(e));
             }
         };
         
-        let mut error_buf = vec![0u8; 256];
-        
-        println!("[SGX] Loading WASM module into SGX enclave...");
         let mut module = ptr::null_mut();
         let result = unsafe {
             wamr_sgx_load_module(
@@ -184,23 +215,18 @@ impl WasmModule {
                     format!("Unknown error: {}", result)
                 }
             };
-            
-            println!("[SGX Error] Failed to load WASM module: {} (0x{:x})", result, result);
-            println!("[SGX Error] Error message: {}", error_msg);
+
+            error!("[SGX Error] Failed to load WASM module: {} (0x{:x})", result, result);
+            error!("[SGX Error] Error message: {}", error_msg);
             
             return Err(Error::ModuleLoadFailed(result));
         }
         
-        println!("[SGX] WASM module loaded successfully: {:p}", module);
         
-        println!("[SGX] Creating WASM instance...");
         let mut instance = ptr::null_mut();
         let stack_size = 32 * 1024 * 1024;
         let heap_size = 64 * 1024 * 1024;
         
-        println!("[SGX] Instantiating with stack size: {}MB, heap size: {}MB", 
-            stack_size / (1024 * 1024),
-            heap_size / (1024 * 1024));
         
         let result = unsafe {
             wamr_sgx_instantiate(
@@ -225,20 +251,18 @@ impl WasmModule {
                     format!("Instantiation failed: {}", result)
                 }
             };
-            
-            println!("[SGX Error] Failed to instantiate WASM module: {} (0x{:x})", result, result);
-            println!("[SGX Error] Error message: {}", error_msg);
+
+            error!("[SGX Error] Failed to instantiate WASM module: {} (0x{:x})", result, result);
+            error!("[SGX Error] Error message: {}", error_msg);
             
             return Err(Error::ModuleLoadFailed(result));
         }
         
-        println!("[SGX] WASM instance created successfully: {:p}", instance);
         
         Ok(Self { module, instance })
     }
     
     pub fn call_function(&self, name: &str, args: &[Value]) -> Result<Vec<Value>, Error> {
-        println!("[SGX] Calling function: {} with {} arguments", name, args.len());
         
         let name_c = CString::new(name)
             .map_err(|_| Error::InvalidArgument("Function name contains null bytes".to_string()))?;
@@ -247,14 +271,6 @@ impl WasmModule {
             .map(|arg| arg.clone().into())
             .collect();
         
-        for (i, arg) in args.iter().enumerate() {
-            match arg {
-                Value::I32(v) => println!("[SGX] Arg {}: I32({})", i, v),
-                Value::I64(v) => println!("[SGX] Arg {}: I64({})", i, v),
-                Value::F32(v) => println!("[SGX] Arg {}: F32({})", i, v),
-                Value::F64(v) => println!("[SGX] Arg {}: F64({})", i, v),
-            }
-        }
         
         let result_count = match name {
             "wbm_free" => 0,
@@ -270,7 +286,6 @@ impl WasmModule {
             });
         }
         
-        println!("[SGX] Calling function with {} expected return values", returns.len());
         
         let result = unsafe {
             wamr_sgx_call_function(
@@ -293,23 +308,15 @@ impl WasmModule {
                     format!("Unknown error: {}", result)
                 }
             };
-            
-            println!("[SGX Error] Function call failed: {} (0x{:x})", result, result);
-            println!("[SGX Error] Error message: {}", error_msg);
+
+            error!("[SGX Error] Function call failed: {} (0x{:x})", result, result);
+            error!("[SGX Error] Error message: {}", error_msg);
             return Err(Error::FunctionCallFailed(result));
         }
         
-        println!("[SGX] Function call succeeded, processing {} return values", returns.len());
         let values = returns.into_iter()
             .map(|val| {
                 let result = Value::try_from(val);
-                match &result {
-                    Ok(Value::I32(v)) => println!("[SGX] Return: I32({})", v),
-                    Ok(Value::I64(v)) => println!("[SGX] Return: I64({})", v),
-                    Ok(Value::F32(v)) => println!("[SGX] Return: F32({})", v),
-                    Ok(Value::F64(v)) => println!("[SGX] Return: F64({})", v),
-                    Err(e) => println!("[SGX Error] Failed to convert return value: {}", e),
-                }
                 result
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -322,13 +329,11 @@ impl WasmModule {
             values
         };
         
-        println!("[SGX] Function {} returned successfully with {} values", name, values.len());
         
         Ok(values)
     }
     
     pub fn read_memory(&self, offset: u32, size: u32) -> Result<Vec<u8>, Error> {
-        println!("[SGX] Reading memory at offset {} with size {}", offset, size);
         
         let mut buffer = vec![0u8; size as usize];
         
@@ -337,7 +342,6 @@ impl WasmModule {
         for chunk_start in (0..size).step_by(CHUNK_SIZE as usize) {
             let chunk_size = std::cmp::min(CHUNK_SIZE, size - chunk_start);
             
-            println!("[SGX] Processing chunk at offset {} with size {}", offset + chunk_start, chunk_size);
             
             if let Ok(_) = self.call_memory_copy_function(
                 offset + chunk_start,
@@ -353,7 +357,6 @@ impl WasmModule {
             )?;
         }
         
-        println!("[SGX] Successfully read {} bytes from memory", buffer.len());
         Ok(buffer)
     }
     
@@ -593,10 +596,8 @@ impl WasmModule {
     }
     
     pub fn write_memory(&self, offset: u32, data: &[u8]) -> Result<(), Error> {
-        println!("[SGX] Writing {} bytes to memory at offset {}", data.len(), offset);
         
         if data.is_empty() {
-            println!("[SGX] Empty data buffer, nothing to write");
             return Ok(());
         }
         
@@ -607,7 +608,6 @@ impl WasmModule {
             let chunk_size = chunk_end - chunk_start;
             let target_offset = offset + chunk_start as u32;
             
-            println!("[SGX] Writing chunk of {} bytes at offset {}", chunk_size, target_offset);
             
             if let Ok(_) = self.call_memory_copy_for_write(
                 target_offset, 
@@ -634,7 +634,6 @@ impl WasmModule {
             }
         }
         
-        println!("[SGX] Successfully wrote {} bytes to memory at offset {}", data.len(), offset);
         Ok(())
     }
     
@@ -719,21 +718,6 @@ impl WasmModule {
     }
 }
 
-impl Drop for WasmModule {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.instance.is_null() {
-                wamr_sgx_destroy_instance(SGX_CONTEXT, self.instance);
-                self.instance = ptr::null_mut();
-            }
-            
-            if !self.module.is_null() {
-                wamr_sgx_unload_module(SGX_CONTEXT, self.module);
-                self.module = ptr::null_mut();
-            }
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct BlockBuilderSgx {
@@ -819,27 +803,30 @@ impl BlockBuilderSgx {
         Ok(info)
     }
     pub fn get_public_key(&self) -> Result<String, Error> {
-        println!("[SGX] Getting public key from enclave");
-        let buffer_size = 256;
-        let alloc_args = vec![Value::I32(buffer_size as i32)];
+        
+        let initial_buffer_size = 1024; 
+        let alloc_args = vec![Value::I32(initial_buffer_size as i32)];
         let alloc_result = self.module.call_function("wbm_alloc", &alloc_args)?;
         
         let output_ptr = match &alloc_result[0] {
             Value::I32(ptr) => *ptr as u32,
             _ => return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string())),
         };
+        
         let len_alloc_args = vec![Value::I32(4)];
         let len_alloc_result = self.module.call_function("wbm_alloc", &len_alloc_args)?;
         
         let len_ptr = match &len_alloc_result[0] {
             Value::I32(ptr) => *ptr as u32,
             _ => {
-                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_buffer_size as i32)];
                 let _ = self.module.call_function("wbm_free", &free_output_args);
                 return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
             }
         };
-        self.module.write_memory(len_ptr, &(buffer_size as u32).to_le_bytes())?;
+        
+        self.module.write_memory(len_ptr, &(initial_buffer_size as u32).to_le_bytes())?;
+        
         let get_pk_args = vec![
             Value::I32(output_ptr as i32),
             Value::I32(len_ptr as i32),
@@ -850,22 +837,23 @@ impl BlockBuilderSgx {
         let result_code = match &pk_result[0] {
             Value::I32(code) => *code,
             _ => {
-                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_buffer_size as i32)];
                 let _ = self.module.call_function("wbm_free", &free_output_args);
                 let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
                 let _ = self.module.call_function("wbm_free", &free_len_args);
-                println!("Invalid result code from get_public_key");
                 return Err(Error::InvalidArgument("Invalid result code from get_public_key".to_string()));
             }
         };
         
         if result_code == -2 {
+            
             let len_data = self.module.read_memory(len_ptr, 4)?;
             let required_size = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
             
-            println!("[SGX] Public key buffer too small, need {} bytes", required_size);
-            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+            
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_buffer_size as i32)];
             let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            
             let new_alloc_args = vec![Value::I32(required_size as i32)];
             let new_alloc_result = self.module.call_function("wbm_alloc", &new_alloc_args)?;
             
@@ -877,7 +865,9 @@ impl BlockBuilderSgx {
                     return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
                 }
             };
+            
             self.module.write_memory(len_ptr, &required_size.to_le_bytes())?;
+            
             let new_get_pk_args = vec![
                 Value::I32(new_output_ptr as i32),
                 Value::I32(len_ptr as i32),
@@ -904,92 +894,231 @@ impl BlockBuilderSgx {
                 
                 return Err(Error::FunctionCallFailed(new_result_code));
             }
+            
             let len_data = self.module.read_memory(len_ptr, 4)?;
             let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
             
             let key_data = self.module.read_memory(new_output_ptr, output_len)?;
+            
             let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
             let _ = self.module.call_function("wbm_free", &free_output_args)?;
             let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
             let _ = self.module.call_function("wbm_free", &free_len_args)?;
-            String::from_utf8(key_data)
-                .map_err(|_| Error::InvalidArgument("Public key data is not valid UTF-8".to_string()))
             
+            let key_string = String::from_utf8(key_data)
+                .map_err(|_| Error::InvalidArgument("Public key data is not valid UTF-8".to_string()))?;
+            
+            Ok(key_string)
         } else if result_code != 0 {
-            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_buffer_size as i32)];
             let _ = self.module.call_function("wbm_free", &free_output_args)?;
             let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
             let _ = self.module.call_function("wbm_free", &free_len_args)?;
             
             return Err(Error::FunctionCallFailed(result_code));
         } else {
+            
             let len_data = self.module.read_memory(len_ptr, 4)?;
             let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
             
             let key_data = self.module.read_memory(output_ptr, output_len)?;
-            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(buffer_size as i32)];
+            
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_buffer_size as i32)];
             let _ = self.module.call_function("wbm_free", &free_output_args)?;
             let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
             let _ = self.module.call_function("wbm_free", &free_len_args)?;
-            String::from_utf8(key_data)
-                .map_err(|_| Error::InvalidArgument("Public key data is not valid UTF-8".to_string()))
+            
+            let key_string = String::from_utf8(key_data)
+                .map_err(|_| Error::InvalidArgument("Public key data is not valid UTF-8".to_string()))?;
+            
+            Ok(key_string)
         }
     }
     
     pub fn build_block(&self, input_json: &str) -> Result<String, Error> {
-        println!("[SGX] Starting block building with input size: {} bytes", input_json.len());
+        const INPUT_CHUNK_SIZE: usize = 64 * 1024; 
         
-        const CHUNK_SIZE: usize = 32 * 1024;
+        let mut attempt = 0;
+        let max_attempts = 1; 
+        let mut input_ptr = 0u32;
         
-        let alloc_args = vec![Value::I32(input_json.len() as i32)];
-        println!("[SGX] Allocating {} bytes for input JSON", input_json.len());
-        let alloc_result = self.module.call_function("wbm_alloc", &alloc_args)?;
+        let max_single_alloc = 256 * 1024; 
+        let alloc_size = std::cmp::min(input_json.len(), max_single_alloc);
+
+        debug!("[SGX Memory] Allocating memory for input: {} bytes (input size: {} bytes)", 
+                 alloc_size, input_json.len());
         
-        let input_ptr = match &alloc_result[0] {
-            Value::I32(ptr) => *ptr as u32,
-            _ => return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string())),
-        };
-        
-        println!("[SGX] Writing input data in chunks");
-        for chunk_start in (0..input_json.len()).step_by(CHUNK_SIZE) {
-            let chunk_end = std::cmp::min(chunk_start + CHUNK_SIZE, input_json.len());
-            let chunk = &input_json.as_bytes()[chunk_start..chunk_end];
-            let target_offset = input_ptr + chunk_start as u32;
-            
-            self.module.write_memory(target_offset, chunk)?;
+        while attempt < max_attempts {
+            attempt += 1;
+            let alloc_args = vec![Value::I32(alloc_size as i32)];
+            match self.module.call_function("wbm_alloc", &alloc_args) {
+                Ok(result) => {
+                    match &result[0] {
+                        Value::I32(ptr) => {
+                            input_ptr = *ptr as u32;
+                            debug!("[SGX Memory] Successfully allocated {} bytes at ptr {}", alloc_size, input_ptr);
+                            break;
+                        },
+                        _ => {
+                            if attempt == max_attempts {
+                                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                            }
+                            debug!("[SGX Memory] Invalid pointer type returned, retrying in {}ms", 200 * attempt);
+                            std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("[SGX Error] Failed to allocate memory for input after {} attempts: {}", attempt, e);
+                }
+            }
         }
         
-        let initial_output_size = 128 * 1024;
-        println!("[SGX] Allocating initial output buffer of {} bytes", initial_output_size);
-        let output_alloc_args = vec![Value::I32(initial_output_size as i32)];
-        let output_alloc_result = self.module.call_function("wbm_alloc", &output_alloc_args)?;
-        
-        let output_ptr = match &output_alloc_result[0] {
-            Value::I32(ptr) => *ptr as u32,
-            _ => {
-                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
-                let _ = self.module.call_function("wbm_free", &free_input_args);
-                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+        for chunk_start in (0..input_json.len()).step_by(INPUT_CHUNK_SIZE).enumerate() {
+            let chunk_end = std::cmp::min(chunk_start.1 + INPUT_CHUNK_SIZE, input_json.len());
+            let chunk = &input_json.as_bytes()[chunk_start.1..chunk_end];
+            let target_offset = input_ptr + chunk_start.1 as u32;
+            
+            let mut write_attempt = 0;
+            let max_write_attempts = 3;
+            let mut write_success = false;
+            
+            while write_attempt < max_write_attempts && !write_success {
+                write_attempt += 1;
+                match self.module.write_memory(target_offset, chunk) {
+                    Ok(_) => {
+                        write_success = true;
+                    },
+                    Err(e) => {
+                        if write_attempt == max_write_attempts {
+                            let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                            let _ = self.module.call_function("wbm_free", &free_input_args);
+                            return Err(e);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
             }
-        };
+        }
         
-        let len_alloc_args = vec![Value::I32(4)];
-        let len_alloc_result = self.module.call_function("wbm_alloc", &len_alloc_args)?;
+        let initial_output_size = 128 * 1024; 
         
-        let len_ptr = match &len_alloc_result[0] {
-            Value::I32(ptr) => *ptr as u32,
-            _ => {
-                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+        attempt = 0;
+        let mut output_ptr = 0u32;
+
+        debug!("[SGX Memory] Allocating output buffer: {} bytes", initial_output_size);
+        
+        while attempt < max_attempts {
+            attempt += 1;
+            
+            if attempt > 2 && alloc_size < input_json.len() {
+                warn!("[SGX Memory] Freeing input buffer to reduce memory pressure");
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
                 let _ = self.module.call_function("wbm_free", &free_input_args);
-                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
-                let _ = self.module.call_function("wbm_free", &free_output_args);
-                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
             }
-        };
+            
+            let output_alloc_args = vec![Value::I32(initial_output_size as i32)];
+            match self.module.call_function("wbm_alloc", &output_alloc_args) {
+                Ok(result) => {
+                    match &result[0] {
+                        Value::I32(ptr) => {
+                            output_ptr = *ptr as u32;
+                            debug!("[SGX Memory] Successfully allocated output buffer of {} bytes at ptr {}", 
+                                    initial_output_size, output_ptr);
+                            break;
+                        },
+                        _ => {
+                            if attempt == max_attempts {
+                                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                                let _ = self.module.call_function("wbm_free", &free_input_args);
+                                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                            }
+                            warn!("[SGX Memory] Invalid pointer type returned for output buffer, retrying in {}ms", 200 * attempt);
+                            std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                        }
+                    }
+                },
+                Err(e) => {
+                    if attempt == max_attempts {
+                        error!("[SGX Error] Failed to allocate output buffer after {} attempts: {}", max_attempts, e);
+                        let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                        let _ = self.module.call_function("wbm_free", &free_input_args);
+                        return Err(e);
+                    }
+                    warn!("[SGX Memory] Output buffer allocation attempt {} failed: {}, retrying in {}ms", 
+                             attempt, e, 300 * attempt);
+                    std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+                }
+            }
+        }
         
-        self.module.write_memory(len_ptr, &(initial_output_size as u32).to_le_bytes())?;
+        attempt = 0;
+        let mut len_ptr = 0u32;
         
-        println!("[SGX] Calling build_block function");
+        debug!("[SGX Memory] Allocating length buffer: 4 bytes");
+        
+        while attempt < max_attempts {
+            attempt += 1;
+            
+            let len_alloc_args = vec![Value::I32(8)]; 
+            match self.module.call_function("wbm_alloc", &len_alloc_args) {
+                Ok(result) => {
+                    match &result[0] {
+                        Value::I32(ptr) => {
+                            len_ptr = *ptr as u32;
+                            debug!("[SGX Memory] Successfully allocated length buffer of 8 bytes at ptr {}", len_ptr);
+                            break;
+                        },
+                        _ => {
+                            if attempt == max_attempts {
+                                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                                let _ = self.module.call_function("wbm_free", &free_input_args);
+                                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+                                let _ = self.module.call_function("wbm_free", &free_output_args);
+                                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                            }
+                            warn!("[SGX Memory] Invalid pointer type returned for length buffer, retrying in {}ms", 200 * attempt);
+                            std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                        }
+                    }
+                },
+                Err(e) => {
+                    if attempt == max_attempts {
+                        error!("[SGX Error] Failed to allocate length buffer after {} attempts: {}", max_attempts, e);
+                        let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                        let _ = self.module.call_function("wbm_free", &free_input_args);
+                        let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+                        let _ = self.module.call_function("wbm_free", &free_output_args);
+                        return Err(e);
+                    }
+                    warn!("[SGX Memory] Length buffer allocation attempt {} failed: {}, retrying in {}ms", 
+                             attempt, e, 300 * attempt);
+                    
+                    if attempt > 3 {
+                        warn!("[SGX Memory] Freeing input and output buffers to reduce memory pressure");
+                        let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                        let _ = self.module.call_function("wbm_free", &free_input_args);
+                        let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+                        let _ = self.module.call_function("wbm_free", &free_output_args);
+                        
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(300 * attempt as u64));
+                }
+            }
+        }
+        
+        if let Err(e) = self.module.write_memory(len_ptr, &(initial_output_size as u32).to_le_bytes()) {
+            let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+            let _ = self.module.call_function("wbm_free", &free_input_args);
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args);
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args);
+            return Err(e);
+        }
+        
         let build_args = vec![
             Value::I32(input_ptr as i32),
             Value::I32(input_json.len() as i32),
@@ -997,7 +1126,21 @@ impl BlockBuilderSgx {
             Value::I32(len_ptr as i32),
         ];
         
-        let build_result = self.module.call_function("build_block", &build_args)?;
+        let build_result = match self.module.call_function("build_block", &build_args) {
+            Ok(result) => result,
+            Err(e) => {
+                error!("[SGX Error] build_block function call failed: {}", e);
+                
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                
+                return Err(e);
+            }
+        };
         
         let result_code = match &build_result[0] {
             Value::I32(code) => *code,
@@ -1008,6 +1151,7 @@ impl BlockBuilderSgx {
                 let _ = self.module.call_function("wbm_free", &free_output_args);
                 let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
                 let _ = self.module.call_function("wbm_free", &free_len_args);
+                
                 return Err(Error::InvalidArgument("Invalid result code from build_block".to_string()));
             }
         };
@@ -1016,32 +1160,86 @@ impl BlockBuilderSgx {
         let mut actual_output_size = initial_output_size as u32;
         
         if result_code == -2 {
-            println!("[SGX] Initial output buffer too small, resizing");
-            let len_data = self.module.read_memory(len_ptr, 4)?;
-            let required_size = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
-            
-            println!("[SGX] Required output size: {} bytes", required_size);
-            
-            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
-            let _ = self.module.call_function("wbm_free", &free_output_args)?;
-            
-            let new_alloc_args = vec![Value::I32(required_size as i32)];
-            let new_alloc_result = self.module.call_function("wbm_alloc", &new_alloc_args)?;
-            
-            let new_output_ptr = match &new_alloc_result[0] {
-                Value::I32(ptr) => *ptr as u32,
-                _ => {
+            let len_data = match self.module.read_memory(len_ptr, 4) {
+                Ok(data) => data,
+                Err(e) => {
                     let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
                     let _ = self.module.call_function("wbm_free", &free_input_args);
+                    let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+                    let _ = self.module.call_function("wbm_free", &free_output_args);
                     let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
                     let _ = self.module.call_function("wbm_free", &free_len_args);
-                    return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                    return Err(e);
                 }
             };
             
-            self.module.write_memory(len_ptr, &required_size.to_le_bytes())?;
+            let required_size = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
             
-            println!("[SGX] Calling build_block again with larger buffer");
+            if required_size > 50 * 1024 * 1024 {  
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(Error::InvalidArgument(format!("Required output size too large: {} bytes", required_size)));
+            }
+            
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
+            if let Err(_) = self.module.call_function("wbm_free", &free_output_args) {
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            
+            attempt = 0;
+            let mut new_output_ptr = 0u32;
+            
+            while attempt < max_attempts {
+                attempt += 1;
+                let new_alloc_args = vec![Value::I32(required_size as i32)];
+                match self.module.call_function("wbm_alloc", &new_alloc_args) {
+                    Ok(result) => {
+                        match &result[0] {
+                            Value::I32(ptr) => {
+                                new_output_ptr = *ptr as u32;
+                                break;
+                            },
+                            _ => {
+                                if attempt == max_attempts {
+                                    let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                                    let _ = self.module.call_function("wbm_free", &free_input_args);
+                                    let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                                    let _ = self.module.call_function("wbm_free", &free_len_args);
+                                    return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100 * attempt)); 
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        if attempt == max_attempts {
+                            let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                            let _ = self.module.call_function("wbm_free", &free_input_args);
+                            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                            let _ = self.module.call_function("wbm_free", &free_len_args);
+                            error!("[SGX Error] Failed to allocate new output buffer: {}", e);
+                            return Err(e);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100 * attempt)); 
+                    }
+                }
+            }
+            
+            if let Err(e) = self.module.write_memory(len_ptr, &required_size.to_le_bytes()) {
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(e);
+            }
+            
             let new_build_args = vec![
                 Value::I32(input_ptr as i32), 
                 Value::I32(input_json.len() as i32),
@@ -1049,7 +1247,18 @@ impl BlockBuilderSgx {
                 Value::I32(len_ptr as i32),
             ];
             
-            let new_build_result = self.module.call_function("build_block", &new_build_args)?;
+            let new_build_result = match self.module.call_function("build_block", &new_build_args) {
+                Ok(result) => result,
+                Err(e) => {
+                    let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                    let _ = self.module.call_function("wbm_free", &free_input_args);
+                    let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+                    let _ = self.module.call_function("wbm_free", &free_output_args);
+                    let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                    let _ = self.module.call_function("wbm_free", &free_len_args);
+                    return Err(e);
+                }
+            };
             
             let new_result_code = match &new_build_result[0] {
                 Value::I32(code) => *code,
@@ -1060,17 +1269,17 @@ impl BlockBuilderSgx {
                     let _ = self.module.call_function("wbm_free", &free_output_args);
                     let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
                     let _ = self.module.call_function("wbm_free", &free_len_args);
-                    return Err(Error::InvalidArgument("Invalid result code from build_block".to_string()));
+                    return Err(Error::InvalidArgument("Invalid result code from second build_block".to_string()));
                 }
             };
             
             if new_result_code != 0 {
                 let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
-                let _ = self.module.call_function("wbm_free", &free_input_args)?;
+                let _ = self.module.call_function("wbm_free", &free_input_args);
                 let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
-                let _ = self.module.call_function("wbm_free", &free_output_args)?;
+                let _ = self.module.call_function("wbm_free", &free_output_args);
                 let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
-                let _ = self.module.call_function("wbm_free", &free_len_args)?;
+                let _ = self.module.call_function("wbm_free", &free_len_args);
                 
                 return Err(Error::FunctionCallFailed(new_result_code));
             }
@@ -1079,11 +1288,156 @@ impl BlockBuilderSgx {
             actual_output_size = required_size;
         } else if result_code != 0 {
             let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
-            let _ = self.module.call_function("wbm_free", &free_input_args)?;
+            let _ = self.module.call_function("wbm_free", &free_input_args);
             let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(initial_output_size as i32)];
-            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let _ = self.module.call_function("wbm_free", &free_output_args);
             let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
-            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            let _ = self.module.call_function("wbm_free", &free_len_args);
+            
+            return Err(Error::FunctionCallFailed(result_code));
+        }
+        
+        let len_data = match self.module.read_memory(len_ptr, 4) {
+            Ok(data) => data,
+            Err(e) => {
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let free_output_args = vec![Value::I32(actual_output_ptr as i32), Value::I32(actual_output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(e);
+            }
+        };
+        
+        let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+        
+        if output_len > actual_output_size {
+            let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+            let _ = self.module.call_function("wbm_free", &free_input_args);
+            let free_output_args = vec![Value::I32(actual_output_ptr as i32), Value::I32(actual_output_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args);
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args);
+            return Err(Error::InvalidArgument(format!("Output length ({}) exceeds buffer size ({})", output_len, actual_output_size)));
+        }
+        
+        const OUTPUT_CHUNK_SIZE: u32 = 64 * 1024; 
+        let mut output_data = Vec::with_capacity(output_len as usize);
+        
+        for chunk_start in (0..output_len).step_by(OUTPUT_CHUNK_SIZE as usize) {
+            let chunk_size = std::cmp::min(OUTPUT_CHUNK_SIZE, output_len - chunk_start);
+            
+            let mut read_attempt = 0;
+            let max_read_attempts = 3;
+            let mut chunk_data = Vec::new();
+            
+            while read_attempt < max_read_attempts {
+                read_attempt += 1;
+                match self.module.read_memory(actual_output_ptr + chunk_start, chunk_size) {
+                    Ok(data) => {
+                        chunk_data = data;
+                        break;
+                    },
+                    Err(e) => {
+                        if read_attempt == max_read_attempts {
+                            let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
+                            let _ = self.module.call_function("wbm_free", &free_input_args);
+                            let free_output_args = vec![Value::I32(actual_output_ptr as i32), Value::I32(actual_output_size as i32)];
+                            let _ = self.module.call_function("wbm_free", &free_output_args);
+                            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                            let _ = self.module.call_function("wbm_free", &free_len_args);
+                            return Err(e);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                }
+            }
+            
+            output_data.extend_from_slice(&chunk_data);
+        }
+
+        debug!("[SGX Memory] Cleaning up resources");
+        
+        let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+        if let Err(e) = self.module.call_function("wbm_free", &free_input_args) {
+            error!("[SGX Warning] Failed to free input buffer: {}", e);
+        } else {
+            debug!("[SGX Memory] Successfully freed input buffer of {} bytes at ptr {}", 
+                    alloc_size, input_ptr);
+        }
+        
+        let free_output_args = vec![Value::I32(actual_output_ptr as i32), Value::I32(actual_output_size as i32)];
+        if let Err(e) = self.module.call_function("wbm_free", &free_output_args) {
+            error!("[SGX Warning] Failed to free output buffer: {}", e);
+        } else {
+            debug!("[SGX Memory] Successfully freed output buffer of {} bytes at ptr {}", 
+                    actual_output_size, actual_output_ptr);
+        }
+        
+        let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(8)]; 
+        if let Err(e) = self.module.call_function("wbm_free", &free_len_args) {
+            error!("[SGX Warning] Failed to free length buffer: {}", e);
+        } else {
+            debug!("[SGX Memory] Successfully freed length buffer of 8 bytes at ptr {}", len_ptr);
+        }
+        
+        let output_str = match String::from_utf8(output_data) {
+            Ok(str) => str,
+            Err(_) => return Err(Error::InvalidArgument("Output is not valid UTF-8".to_string())),
+        };
+        
+        Ok(output_str)
+    }
+    
+    pub fn get_module_info(&self) -> Result<String, Error> {
+        
+        let output_size = 4096;
+        let alloc_args = vec![Value::I32(output_size as i32)];
+        let alloc_result = self.module.call_function("wbm_alloc", &alloc_args)?;
+        
+        let output_ptr = match &alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string())),
+        };
+        
+        let len_alloc_args = vec![Value::I32(4)];
+        let len_alloc_result = self.module.call_function("wbm_alloc", &len_alloc_args)?;
+        
+        let len_ptr = match &len_alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+            }
+        };
+        
+        self.module.write_memory(len_ptr, &(output_size as u32).to_le_bytes())?;
+        
+        let get_info_args = vec![
+            Value::I32(output_ptr as i32),
+            Value::I32(len_ptr as i32),
+        ];
+        
+        let info_result = self.module.call_function("get_module_info", &get_info_args)?;
+        
+        let result_code = match &info_result[0] {
+            Value::I32(code) => *code,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(Error::InvalidArgument("Invalid result code from get_module_info".to_string()));
+            }
+        };
+        
+        if result_code != 0 {
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args);
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args);
             
             return Err(Error::FunctionCallFailed(result_code));
         }
@@ -1091,445 +1445,29 @@ impl BlockBuilderSgx {
         let len_data = self.module.read_memory(len_ptr, 4)?;
         let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
         
-        println!("[SGX] Reading output data of size: {} bytes", output_len);
-        
+        let chunk_size = 1024; 
         let mut output_data = Vec::with_capacity(output_len as usize);
-        const READ_CHUNK_SIZE: u32 = 32 * 1024;
         
-        for chunk_start in (0..output_len).step_by(READ_CHUNK_SIZE as usize) {
-            let chunk_size = std::cmp::min(READ_CHUNK_SIZE, output_len - chunk_start);
-            let chunk_data = self.module.read_memory(actual_output_ptr + chunk_start, chunk_size)?;
+        for chunk_start in (0..output_len).step_by(chunk_size as usize) {
+            let chunk_size = std::cmp::min(chunk_size, output_len - chunk_start);
+            
+            let chunk_data = self.module.read_memory(output_ptr + chunk_start, chunk_size)?;
             output_data.extend_from_slice(&chunk_data);
         }
         
-        println!("[SGX] Freeing allocated memory");
-        let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(input_json.len() as i32)];
-        let _ = self.module.call_function("wbm_free", &free_input_args)?;
-        
-        let free_output_args = vec![Value::I32(actual_output_ptr as i32), Value::I32(actual_output_size as i32)];
-        let _ = self.module.call_function("wbm_free", &free_output_args)?;
+        let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+        let _ = self.module.call_function("wbm_free", &free_output_args);
         
         let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
-        let _ = self.module.call_function("wbm_free", &free_len_args)?;
+        let _ = self.module.call_function("wbm_free", &free_len_args);
         
-        println!("[SGX] Converting output to UTF-8 string");
         let output_str = String::from_utf8(output_data)
-            .map_err(|_| Error::InvalidArgument("Output is not valid UTF-8".to_string()))?;
+            .map_err(|_| Error::InvalidArgument("Module info data is not valid UTF-8".to_string()))?;
         
-        println!("[SGX] Block building completed successfully");
-        Ok(output_str)
-    }
-    
-    pub fn get_module_info(&self) -> Result<String, Error> {
-        println!("Getting module info from SGX enclave...");
-        
-        println!("[SGX] Getting module info - Step 1: Function entry");
-
-        let output_size = 4096;
-        println!("[SGX] Getting module info - Step 2: Preparing allocation arguments");
-        
-        let mut output_alloc_arg = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_size },
-        };
-        
-        let mut output_alloc_return = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 0 },
-        };
-        
-        let alloc_name_c = CString::new("wbm_alloc").unwrap();
-        println!("[SGX] Getting module info - Step 3: Calling wbm_alloc for output buffer");
-        
-        unsafe {
-            println!("[SGX Debug] SGX_CONTEXT: {:p}, module instance: {:p}", SGX_CONTEXT, self.module.instance);
-            println!("[SGX Debug] Function args size: output_alloc_arg={} bytes, output_alloc_return={} bytes", 
-                     std::mem::size_of_val(&output_alloc_arg), 
-                     std::mem::size_of_val(&output_alloc_return));
-            println!("[SGX Debug] Allocated pointers: alloc_name_c={:p}", alloc_name_c.as_ptr());
-            
-            let stack_var_address = &output_size as *const _ as usize;
-            println!("[SGX Debug] Local variable address (stack indicator): 0x{:x}", stack_var_address);
-        }
-        
-        let output_alloc_result = unsafe {
-            println!("[SGX Debug] wamr_sgx_init @ {:p}", wamr_sgx_init as *const ());
-            println!("[SGX Debug] wamr_sgx_load_module @ {:p}", wamr_sgx_load_module as *const ());
-            println!("[SGX Debug] wamr_sgx_instantiate @ {:p}", wamr_sgx_instantiate as *const ());
-            println!("[SGX Debug] wamr_sgx_call_function @ {:p}", wamr_sgx_call_function as *const ());
-            wamr_sgx_call_function(
-                SGX_CONTEXT,
-                self.module.instance,
-                alloc_name_c.as_ptr(),
-                &mut output_alloc_arg,
-                1,
-                &mut output_alloc_return,
-                1
-            )
-        };
-        
-        if output_alloc_result != 0 {
-            println!("[SGX Error] Failed to allocate output buffer: {}", output_alloc_result);
-            return Err(Error::FunctionCallFailed(output_alloc_result));
-        }
-        
-        let output_ptr = unsafe { output_alloc_return.value.i32_ as u32 };
-        println!("[SGX] Getting module info - Step 4: Got output buffer at address {}", output_ptr);
-        
-        let mut len_alloc_arg = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 4 },
-        };
-        
-        let mut len_alloc_return = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 0 },
-        };
-        
-        println!("[SGX] Getting module info - Step 5: Calling wbm_alloc for length buffer");
-        let len_alloc_result = unsafe {
-            wamr_sgx_call_function(
-                SGX_CONTEXT,
-                self.module.instance,
-                alloc_name_c.as_ptr(),
-                &mut len_alloc_arg,
-                1,
-                &mut len_alloc_return,
-                1
-            )
-        };
-        
-        if len_alloc_result != 0 {
-            let mut free_output_arg1 = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_ptr as i32 },
-            };
-            
-            let mut free_output_arg2 = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_size },
-            };
-            
-            let free_name_c = CString::new("wbm_free").unwrap();
-            unsafe {
-                wamr_sgx_call_function(
-                    SGX_CONTEXT,
-                    self.module.instance,
-                    free_name_c.as_ptr(),
-                    &mut free_output_arg1,
-                    1,
-                    std::ptr::null_mut(),
-                    0
-                )
-            };
-            
-            return Err(Error::FunctionCallFailed(len_alloc_result));
-        }
-        
-        let len_ptr = unsafe { len_alloc_return.value.i32_ as u32 };
-        println!("[SGX] Getting module info - Step 6: Got length buffer at address {}", len_ptr);
-        
-        let length_bytes = (output_size as u32).to_le_bytes();
-        println!("[SGX] Getting module info - Step 7: Starting to write length bytes");
-        let set_byte_name_c = CString::new("wbm_set_byte").unwrap();
-        let mut arg_buf  = [wamr_sgx_val_t::default(); 2];
-        arg_buf[1].value.i32_ = 0i32;
-        
-        for i in 0..4 {
-            println!("[SGX] Getting module info - Step 7.{}: Writing byte {} of length", i+1, i+1);
-
-            arg_buf[0].value.i32_ = length_bytes[i] as i32;
-            arg_buf[1].value.i32_ = (len_ptr + i as u32) as i32;
-
-            let mut ret_val = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 0 },
-            };
-            
-            let set_byte_result = unsafe {
-                wamr_sgx_call_function(
-                    SGX_CONTEXT,
-                    self.module.instance,
-                    set_byte_name_c.as_ptr(),
-                    arg_buf.as_mut_ptr(),
-                    2,
-                    &mut ret_val,
-                    1
-                )
-            };
-            
-            if set_byte_result != 0 {
-                return Err(Error::FunctionCallFailed(set_byte_result));
-            }
-        }
-        
-        println!("[SGX] Getting module info - Step 8: Calling get_module_info WASM function");
-        let mut info_arg1 = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_ptr as i32 },
-        };
-        
-        let mut info_arg2 = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: len_ptr as i32 },
-        };
-        
-        let mut info_return = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 0 },
-        };
-        
-        let info_name_c = CString::new("get_module_info").unwrap();
-        let mut info_args = [info_arg1, info_arg2];
-        
-        println!("[SGX] Getting module info - Step 8.1: About to make actual WASM call");
-        let info_result = unsafe {
-            wamr_sgx_call_function(
-                SGX_CONTEXT,
-                self.module.instance,
-                info_name_c.as_ptr(),
-                info_args.as_mut_ptr(),
-                2,
-                &mut info_return,
-                1
-            )
-        };
-        println!("[SGX] Getting module info - Step 8.2: WASM call completed with result {}", info_result);
-        
-        let result_code = unsafe { info_return.value.i32_ };
-        println!("[SGX] Getting module info - Step 9: Processing result code: {}", result_code);
-        
-        if info_result != 0 || result_code != 0 {
-            let free_name_c = CString::new("wbm_free").unwrap();
-            
-            let mut free_output_arg1 = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_ptr as i32 },
-            };
-            
-            let mut free_output_arg2 = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_size },
-            };
-            
-            let mut free_args = [free_output_arg1, free_output_arg2];
-            unsafe {
-                wamr_sgx_call_function(
-                    SGX_CONTEXT,
-                    self.module.instance,
-                    free_name_c.as_ptr(),
-                    free_args.as_mut_ptr(),
-                    2,
-                    std::ptr::null_mut(),
-                    0
-                )
-            };
-            
-            let mut free_len_arg1 = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: len_ptr as i32 },
-            };
-            
-            let mut free_len_arg2 = wamr_sgx_val_t {
-                type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 4 },
-            };
-            
-            let mut free_args = [free_len_arg1, free_len_arg2];
-            unsafe {
-                wamr_sgx_call_function(
-                    SGX_CONTEXT,
-                    self.module.instance,
-                    free_name_c.as_ptr(),
-                    free_args.as_mut_ptr(),
-                    2,
-                    std::ptr::null_mut(),
-                    0
-                )
-            };
-            
-            if info_result != 0 {
-                return Err(Error::FunctionCallFailed(info_result));
-            } else {
-                return Err(Error::FunctionCallFailed(result_code));
-            }
-        }
-        
-        let mut len_data = [0u8; 4];
-        println!("[SGX] Getting module info - Step 10: Reading length bytes");
-
-        let get_byte_name_c = CString::new("wbm_get_byte").unwrap();
-        let mut arg_buf  = [wamr_sgx_val_t::default(); 2];
-        arg_buf[1].value.i32_ = 0i32;
-        
-        for i in 0..4 {
-            println!("[SGX] Getting module info - Step 10.{}: Reading byte {} of length", i+1, i+1);
-            arg_buf[0].value.i32_ = (len_ptr + i as u32) as i32;
-
-            let read_result = unsafe {
-                wamr_sgx_call_function(
-                    SGX_CONTEXT,
-                    self.module.instance,
-                    get_byte_name_c.as_ptr(),
-                    &mut arg_buf[0],
-                    1,
-                    &mut arg_buf[1],
-                    1
-                )
-            };
-            
-            if read_result != 0 {
-                let free_name_c = CString::new("wbm_free").unwrap();
-                
-                let mut free_output_arg1 = wamr_sgx_val_t {
-                    type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                    value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_ptr as i32 },
-                };
-                
-                let mut free_output_arg2 = wamr_sgx_val_t {
-                    type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                    value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_size },
-                };
-                
-                let mut free_args = [free_output_arg1, free_output_arg2];
-                unsafe {
-                    wamr_sgx_call_function(
-                        SGX_CONTEXT,
-                        self.module.instance,
-                        free_name_c.as_ptr(),
-                        free_args.as_mut_ptr(),
-                        2,
-                        std::ptr::null_mut(),
-                        0
-                    )
-                };
-                
-                let mut free_len_arg1 = wamr_sgx_val_t {
-                    type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                    value: wamr_sgx_val_t__bindgen_ty_1 { i32_: len_ptr as i32 },
-                };
-                
-                let mut free_len_arg2 = wamr_sgx_val_t {
-                    type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-                    value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 4 },
-                };
-                
-                let mut free_args = [free_len_arg1, free_len_arg2];
-                unsafe {
-                    wamr_sgx_call_function(
-                        SGX_CONTEXT,
-                        self.module.instance,
-                        free_name_c.as_ptr(),
-                        free_args.as_mut_ptr(),
-                        2,
-                        std::ptr::null_mut(),
-                        0
-                    )
-                };
-                
-                return Err(Error::FunctionCallFailed(read_result));
-            }
-            
-            len_data[i] = unsafe { arg_buf[1].value.i32_ as u8 };
-        }
-        
-        let output_len = u32::from_le_bytes(len_data);
-        println!("[SGX] Getting module info - Step 11: Read length value: {} bytes", output_len);
-        
-        let mut output_data = Vec::with_capacity(output_len as usize);
-        println!("[SGX] Getting module info - Step 12: Reading {} bytes of data", output_len);
-        
-        let max_bytes_to_read = std::cmp::min(output_len, 100);
-        println!("[SGX] Getting module info - Step 12.1: Limited to first {} bytes for debugging", max_bytes_to_read);
-        let get_byte_name_c = CString::new("wbm_get_byte").unwrap();
-        let mut arg_buf  = [wamr_sgx_val_t::default(); 2];
-        arg_buf[1].value.i32_ = 0i32;
-        
-        for i in 0..max_bytes_to_read {
-            if i % 10 == 0 {
-                println!("[SGX] Getting module info - Step 12.2: Reading byte {}/{}", i, max_bytes_to_read);
-            }
-            arg_buf[0].value.i32_ = (output_ptr + i) as i32;
-
-            let read_result = unsafe {
-                wamr_sgx_call_function(
-                    SGX_CONTEXT,
-                    self.module.instance,
-                    get_byte_name_c.as_ptr(),
-                    &mut arg_buf[0],
-                    1,
-                    &mut arg_buf[1],
-                    1
-                )
-            };
-            
-            if read_result != 0 {
-                break;
-            }
-            
-            output_data.push(unsafe { arg_buf[1].value.i32_ as u8 });
-        }
-        
-        println!("[SGX] Getting module info - Step 13: Freeing memory");
-        let free_name_c = CString::new("wbm_free").unwrap();
-        
-        let mut free_output_arg1 = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_ptr as i32 },
-        };
-        
-        let mut free_output_arg2 = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: output_size },
-        };
-        
-        let mut free_args = [free_output_arg1, free_output_arg2];
-        unsafe {
-            wamr_sgx_call_function(
-                SGX_CONTEXT,
-                self.module.instance,
-                free_name_c.as_ptr(),
-                free_args.as_mut_ptr(),
-                2,
-                std::ptr::null_mut(),
-                0
-            )
-        };
-        
-        let mut free_len_arg1 = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: len_ptr as i32 },
-        };
-        
-        let mut free_len_arg2 = wamr_sgx_val_t {
-            type_: wamr_sgx_val_type_t_WAMR_SGX_VAL_TYPE_I32,
-            value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 4 },
-        };
-        
-        let mut free_args = [free_len_arg1, free_len_arg2];
-        unsafe {
-            wamr_sgx_call_function(
-                SGX_CONTEXT,
-                self.module.instance,
-                free_name_c.as_ptr(),
-                free_args.as_mut_ptr(),
-                2,
-                std::ptr::null_mut(),
-                0
-            )
-        };
-        
-        println!("[SGX] Getting module info - Step 14: Converting output to string");
-        let output_str = String::from_utf8(output_data)
-            .map_err(|_| Error::InvalidArgument("Output is not valid UTF-8".to_string()))?;
-        
-        println!("[SGX] Getting module info - Step 15: Successfully retrieved module info");
         Ok(output_str)
     }
     
     pub fn estimate_gas(&self, tx_json: &str, state_json: &str) -> Result<u64, Error> {
-        println!("[SGX] Starting gas estimation. TX size: {} bytes, State size: {} bytes", 
-            tx_json.len(), state_json.len());
         
         const CHUNK_SIZE: usize = 32 * 1024;
         
@@ -1583,7 +1521,6 @@ impl BlockBuilderSgx {
             }
         };
         
-        println!("[SGX] Calling estimate_gas function");
         let args = vec![
             Value::I32(tx_ptr as i32),
             Value::I32(tx_json.len() as i32),
@@ -1607,7 +1544,6 @@ impl BlockBuilderSgx {
             }
         };
         
-        println!("[SGX] Freeing input memory");
         let free_tx_args = vec![Value::I32(tx_ptr as i32), Value::I32(tx_json.len() as i32)];
         let _ = self.module.call_function("wbm_free", &free_tx_args)?;
         
@@ -1621,7 +1557,6 @@ impl BlockBuilderSgx {
             return Err(Error::FunctionCallFailed(result_code));
         }
         
-        println!("[SGX] Reading gas estimate result");
         let result_data = self.module.read_memory(result_ptr, 8)?;
         let gas_estimate = u64::from_le_bytes([
             result_data[0], result_data[1], result_data[2], result_data[3],
@@ -1631,7 +1566,145 @@ impl BlockBuilderSgx {
         let free_result_args = vec![Value::I32(result_ptr as i32), Value::I32(8)];
         let _ = self.module.call_function("wbm_free", &free_result_args)?;
         
-        println!("[SGX] Gas estimation completed successfully: {}", gas_estimate);
         Ok(gas_estimate)
+    }
+    
+    pub fn get_state_diff_chunk(&self, chunk_id: u32, build_id: &str) -> Result<String, Error> {
+        
+        let build_id_c = CString::new(build_id)
+            .map_err(|_| Error::InvalidArgument("Build ID contains null bytes".to_string()))?;
+        
+        let output_size = 4 * 1024 * 1024; 
+        let alloc_args = vec![Value::I32(output_size as i32)];
+        let alloc_result = self.module.call_function("wbm_alloc", &alloc_args)?;
+        
+        let output_ptr = match &alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string())),
+        };
+        
+        let len_alloc_args = vec![Value::I32(4)];
+        let len_alloc_result = self.module.call_function("wbm_alloc", &len_alloc_args)?;
+        
+        let len_ptr = match &len_alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+            }
+        };
+        
+        self.module.write_memory(len_ptr, &(output_size as u32).to_le_bytes())?;
+        
+        let args = vec![
+            Value::I32(chunk_id as i32),
+            Value::I32(build_id_c.as_ptr() as i32),
+            Value::I32(build_id.len() as i32),
+            Value::I32(output_ptr as i32),
+            Value::I32(len_ptr as i32),
+        ];
+        
+        let result = self.module.call_function("get_state_diff_chunk", &args)?;
+        
+        let result_code = match &result[0] {
+            Value::I32(code) => *code,
+            _ => {
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(Error::InvalidArgument("Invalid result code from get_state_diff_chunk".to_string()));
+            }
+        };
+        
+        if result_code == -2 {
+            let len_data = self.module.read_memory(len_ptr, 4)?;
+            let required_size = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+            
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            
+            let new_alloc_args = vec![Value::I32(required_size as i32)];
+            let new_alloc_result = self.module.call_function("wbm_alloc", &new_alloc_args)?;
+            
+            let new_output_ptr = match &new_alloc_result[0] {
+                Value::I32(ptr) => *ptr as u32,
+                _ => {
+                    let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                    let _ = self.module.call_function("wbm_free", &free_len_args);
+                    return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                }
+            };
+            
+            self.module.write_memory(len_ptr, &required_size.to_le_bytes())?;
+            
+            let new_args = vec![
+                Value::I32(chunk_id as i32),
+                Value::I32(build_id_c.as_ptr() as i32),
+                Value::I32(build_id.len() as i32),
+                Value::I32(new_output_ptr as i32),
+                Value::I32(len_ptr as i32),
+            ];
+            
+            let new_result = self.module.call_function("get_state_diff_chunk", &new_args)?;
+            
+            let new_result_code = match &new_result[0] {
+                Value::I32(code) => *code,
+                _ => {
+                    let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+                    let _ = self.module.call_function("wbm_free", &free_output_args);
+                    let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                    let _ = self.module.call_function("wbm_free", &free_len_args);
+                    return Err(Error::InvalidArgument("Invalid result code from get_state_diff_chunk".to_string()));
+                }
+            };
+            
+            if new_result_code != 0 {
+                let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_output_args)?;
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_len_args)?;
+                
+                return Err(Error::FunctionCallFailed(new_result_code));
+            }
+            
+            let len_data = self.module.read_memory(len_ptr, 4)?;
+            let actual_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+            
+            let data = self.module.read_memory(new_output_ptr, actual_len)?;
+            
+            let free_output_args = vec![Value::I32(new_output_ptr as i32), Value::I32(required_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            
+            let chunk_str = String::from_utf8(data)
+                .map_err(|_| Error::InvalidArgument("Chunk data is not valid UTF-8".to_string()))?;
+            
+            Ok(chunk_str)
+        } else if result_code != 0 {
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            
+            return Err(Error::FunctionCallFailed(result_code));
+        } else {
+            let len_data = self.module.read_memory(len_ptr, 4)?;
+            let actual_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]);
+            
+            let data = self.module.read_memory(output_ptr, actual_len)?;
+            
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+            let _ = self.module.call_function("wbm_free", &free_output_args)?;
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_len_args)?;
+            
+            let chunk_str = String::from_utf8(data)
+                .map_err(|_| Error::InvalidArgument("Chunk data is not valid UTF-8".to_string()))?;
+            
+            Ok(chunk_str)
+        }
     }
 }

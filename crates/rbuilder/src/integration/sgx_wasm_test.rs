@@ -10,7 +10,7 @@ use tracing::{info, warn};
 #[tokio::test]
 pub async fn test_sgx_wasm_block_builder() -> Result<()> {
     let wasm_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/wasm32-wasip1/release/wasm_block_builder.wasm");
+        .join("../../target/wasm32-wasip1/release/wasm_block_builder.aot");
     
     info!("Using WASM module at: {:?}", wasm_path);
     if !wasm_path.exists() {

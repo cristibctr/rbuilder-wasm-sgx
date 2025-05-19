@@ -16,6 +16,8 @@ pub struct SequentialSealerBidMaker {
 
 impl BidMaker for SequentialSealerBidMaker {
     fn send_bid(&self, bid: Bid) {
+        let block_num = bid.view_block().block().building_context().block();
+        tracing::info!("SequentialSealerBidMaker.send_bid() - Sending bid for block number {}", block_num);
         self.pending_bid.update(bid);
     }
 }
@@ -37,11 +39,15 @@ impl PendingBid {
         }
     }
     pub async fn wait_for_change(&self) {
-        self.bid_notify.notified().await
+        tracing::info!("PendingBid.wait_for_change() - About to wait for notification");
+        self.bid_notify.notified().await;
+        tracing::info!("PendingBid.wait_for_change() - Notification received");
     }
     /// Updates bid, replacing  on current (we assume they are always increasing but we don't check it).
     fn update(&self, bid: Bid) {
+        let block_num = bid.view_block().block().building_context().block();
         *self.bid.lock() = Some(bid);
+        tracing::info!("PendingBid.update() - Calling notify_one() for bid with block number {}", block_num);
         self.bid_notify.notify_one();
     }
 
@@ -76,10 +82,18 @@ struct SequentialSealerBidMakerProcess {
 
 impl SequentialSealerBidMakerProcess {
     async fn run(&mut self) {
+        tracing::info!("SequentialSealerBidMakerProcess.run() - Starting run loop");
         loop {
+            tracing::info!("SequentialSealerBidMakerProcess.run() - Entering select! loop");
             tokio::select! {
-                _ = self.pending_bid.wait_for_change() => self.check_for_new_bid().await,
-                _ = self.cancel.cancelled() => return
+                _ = self.pending_bid.wait_for_change() => {
+                    tracing::info!("SequentialSealerBidMakerProcess.run() - Notification received, checking for new bid");
+                    self.check_for_new_bid().await;
+                },
+                _ = self.cancel.cancelled() => {
+                    tracing::info!("SequentialSealerBidMakerProcess.run() - Cancel signal received, stopping");
+                    return;
+                }
             }
         }
     }

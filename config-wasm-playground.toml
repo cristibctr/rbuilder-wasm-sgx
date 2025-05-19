@@ -15,5 +15,5 @@ root_hash_compare_sparse_trie = false
 [[builders]]
 name = "sgx-wasm"
 algo = "sgx-wasm-builder"
-wasm_path = "/home/x33f3/rbuilder/target/wasm32-wasip1/release/wasm_block_builder.wasm"
+wasm_path = "/home/x33f3/rbuilder/target/wasm32-wasip1/release/wasm_block_builder.aot"
 fallback_to_native = true

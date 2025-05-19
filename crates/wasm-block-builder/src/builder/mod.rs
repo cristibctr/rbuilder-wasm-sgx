@@ -11,7 +11,7 @@ use crate::{
 use alloy_primitives::{Address, B256, Bytes, U256};
 use std::time::Instant;
 use thiserror::Error;
-
+use crate::state::CompressionLevel;
 use self::ordering::WasiOrderSorter;
 
 pub use self::simulator::WasiSimulator;
@@ -63,6 +63,10 @@ impl WasiBlockBuilder {
         }
     }
     
+    pub fn simulator(&self) -> &WasiSimulator {
+        &self.simulator
+    }
+    
     pub fn build_block(
         &mut self,
         transactions: Vec<SerializedTransaction>,
@@ -92,7 +96,21 @@ impl WasiBlockBuilder {
         let sim_time = sim_start.elapsed();
         
         let root_hash_start = Instant::now();
-        let state_diff = self.simulator.calculate_state_diff(&self.state)?;
+        
+        let compression_level = match self.config.compression_level.to_lowercase().as_str() {
+            "none" => CompressionLevel::None,
+            "low" => CompressionLevel::Low,
+            "medium" => CompressionLevel::Medium,
+            "high" => CompressionLevel::High,
+            _ => CompressionLevel::Medium,
+        };
+        
+        let (state_diff, enhanced_diff, chunk_info, build_id) = self.simulator.calculate_state_diff(
+            &self.state,
+            self.config.complete_state_diff,
+            self.config.include_merkle_proofs,
+            compression_level
+        )?;
         
         let state_root = None;
         let root_hash_time = root_hash_start.elapsed();
@@ -421,6 +439,9 @@ impl WasiBlockBuilder {
             state_root,
             metrics,
             signature: None,
+            chunk_info,
+            build_id,
+            execution_requests: None,
         })
     }
     

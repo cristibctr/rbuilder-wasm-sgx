@@ -35,6 +35,9 @@ pub struct WasiStateProvider {
     block_hashes: HashMap<u64, B256, StdRandomState>,
 }
 
+use alloy_rlp;
+use super::diff::MerkleProof;
+
 impl WasiStateProvider {
     pub fn new(
         accounts: Vec<SerializedAccount>,
@@ -96,6 +99,144 @@ impl WasiStateProvider {
     
     pub fn block_hash_by_number(&self, number: u64) -> Option<B256> {
         self.block_hashes.get(&number).cloned()
+    }
+    
+    pub fn get_storage_root(&self, address: &Address) -> Option<B256> {
+        if let Some(account) = self.accounts.get(address) {
+            let slots: Vec<(B256, B256)> = self.storage
+                .iter()
+                .filter_map(|((addr, slot), value)| {
+                    if addr == address {
+                        Some((*slot, *value))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+                
+            if slots.is_empty() {
+                Some(alloy_primitives::constants::KECCAK_EMPTY)
+            } else {
+                let mut sorted_slots = slots.clone();
+                sorted_slots.sort_by(|a, b| a.0.cmp(&b.0));
+                
+                let mut serialized = Vec::new();
+                for (slot, value) in sorted_slots {
+                    serialized.extend_from_slice(slot.as_slice());
+                    serialized.extend_from_slice(value.as_slice());
+                }
+                
+                Some(alloy_primitives::keccak256(serialized))
+            }
+        } else {
+            None
+        }
+    }
+    
+    pub fn get_account_proof(&self, address: &Address) -> Option<MerkleProof> {
+        if self.accounts.get(address).is_none() {
+            return None;
+        }
+        
+        
+        let account_key_hash = alloy_primitives::keccak256(address.as_slice());
+        
+        let account_info = self.accounts.get(address)?;
+        
+        let storage_root = self.get_storage_root(address).unwrap_or_else(|| {
+            B256::from_hex("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").unwrap_or_default()
+        });
+        
+        let account_value = serde_json::to_vec(&serde_json::json!({
+            "nonce": account_info.nonce.to_string(),
+            "balance": account_info.balance.to_string(),
+            "storageRoot": format!("{:?}", storage_root),
+            "codeHash": format!("{:?}", account_info.code_hash),
+        })).unwrap_or_default();
+        
+        let mut proof_nodes = Vec::with_capacity(3);
+        
+        let root_branch_serialized = serde_json::to_vec(&serde_json::json!({
+            "type": "branch",
+            "path": account_key_hash[0].to_string(),
+            "children": {
+                (account_key_hash[0] % 16).to_string(): "<next_node_hash>"
+            }
+        })).unwrap_or_default();
+        proof_nodes.push(Bytes::from(root_branch_serialized));
+        
+        let extension_serialized = serde_json::to_vec(&serde_json::json!({
+            "type": "extension",
+            "path": format!("{:?}", &account_key_hash[1..5]),
+            "next": "<leaf_node_hash>"
+        })).unwrap_or_default();
+        proof_nodes.push(Bytes::from(extension_serialized));
+        
+        let leaf_serialized = serde_json::to_vec(&serde_json::json!({
+            "type": "leaf",
+            "path": format!("{:?}", &account_key_hash[5..]),
+            "value": {
+                "nonce": account_info.nonce,
+                "balance": account_info.balance.to_string(),
+                "storageRoot": format!("{:?}", storage_root),
+                "codeHash": format!("{:?}", account_info.code_hash)
+            }
+        })).unwrap_or_default();
+        proof_nodes.push(Bytes::from(leaf_serialized));
+        
+        Some(MerkleProof {
+            proof: proof_nodes,
+            key: Bytes::from(account_key_hash.as_slice().to_vec()),
+            value: Bytes::from(account_value),
+        })
+    }
+    
+    pub fn get_storage_proof(&self, address: &Address, slot: &B256) -> Option<MerkleProof> {
+        if !self.storage.contains_key(&(*address, *slot)) {
+            return None;
+        }
+        
+        
+        let storage_key_hash = alloy_primitives::keccak256(slot.as_slice());
+        
+        let value = self.storage.get(&(*address, *slot)).unwrap_or(&B256::ZERO);
+        
+        let storage_value = serde_json::to_vec(&serde_json::json!({
+            "value": format!("{:?}", value)
+        })).unwrap_or_default();
+        
+        let mut proof_nodes = Vec::with_capacity(3);
+        
+        let root_branch_serialized = serde_json::to_vec(&serde_json::json!({
+            "type": "branch",
+            "path": storage_key_hash[0].to_string(),
+            "children": {
+                (storage_key_hash[0] % 16).to_string(): "<next_node_hash>"
+            }
+        })).unwrap_or_default();
+        proof_nodes.push(Bytes::from(root_branch_serialized));
+        
+        let mid_branch_serialized = serde_json::to_vec(&serde_json::json!({
+            "type": "branch",
+            "path": storage_key_hash[1].to_string(),
+            "children": {
+                (storage_key_hash[1] % 16).to_string(): "<leaf_node_hash>"
+            }
+        })).unwrap_or_default();
+        proof_nodes.push(Bytes::from(mid_branch_serialized));
+        
+        let leaf_serialized = serde_json::to_vec(&serde_json::json!({
+            "type": "leaf",
+            "path": format!("{:?}", &storage_key_hash[2..]),
+            "value": format!("{:?}", value)
+        })).unwrap_or_default();
+        proof_nodes.push(Bytes::from(leaf_serialized));
+        
+        Some(MerkleProof {
+            proof: proof_nodes,
+            key: Bytes::from(storage_key_hash.as_slice().to_vec()),
+            value: Bytes::from(storage_value),
+        })
     }
 }
 

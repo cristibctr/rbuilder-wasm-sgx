@@ -136,6 +136,19 @@ pub struct BlockBuilderConfig {
     pub coinbase_payment: bool,
     
     pub build_timeout_ms: Option<u64>,
+    
+    #[serde(default)]
+    pub complete_state_diff: bool,
+    
+    #[serde(default)]
+    pub include_merkle_proofs: bool,
+    
+    #[serde(default = "default_compression_level")]
+    pub compression_level: String,
+}
+
+fn default_compression_level() -> String {
+    "medium".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

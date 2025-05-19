@@ -71,9 +71,9 @@ fn to_boxed_error(err: AppError) -> Box<dyn std::error::Error> {
 fn default_wasm_path() -> PathBuf {
     let workspace_dir = env::var("CARGO_WORKSPACE_DIR").unwrap_or_else(|_| "../".into());
     let release = Path::new(&workspace_dir)
-        .join("target/wasm32-wasip1/release/wasm_block_builder.wasm");
+        .join("target/wasm32-wasip1/release/wasm_block_builder.aot");
     let debug   = Path::new(&workspace_dir)
-        .join("target/wasm32-wasip1/debug/wasm_block_builder.wasm");
+        .join("target/wasm32-wasip1/debug/wasm_block_builder.aot");
 
     if release.exists() { release } else { debug }
 }

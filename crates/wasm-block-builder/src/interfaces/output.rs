@@ -107,6 +107,12 @@ pub struct BlockBuilderOutput {
     pub metrics: BlockMetrics,
     
     pub signature: Option<Bytes>,
+    
+    pub chunk_info: Option<ChunkInfo>,
+    
+    pub build_id: Option<String>,
+    
+    pub execution_requests: Option<Vec<Bytes>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,6 +222,15 @@ pub struct SerializedCodeDiff {
     pub hash: B256,
     
     pub bytecode: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkInfo {
+    pub chunk_id: u32,
+    
+    pub total_chunks: u32,
+    
+    pub remaining_chunks_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

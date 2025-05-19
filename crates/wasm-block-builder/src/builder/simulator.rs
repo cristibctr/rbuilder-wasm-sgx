@@ -3,9 +3,12 @@ use crate::{
     evm::UsedStateTrace,
     interfaces::{
         input::{BlockBuilderConfig, BlockParams, SerializedTransaction, SerializedAccount, SerializedCode, SerializedStorage},
-        output::{SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, SerializedStorageDiff, SerializedCodeDiff},
+        output::{SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, SerializedStorageDiff, SerializedCodeDiff, ChunkInfo},
     },
-    state::WasiStateProvider,
+    state::{
+        WasiStateProvider, StateDiffCollector, StateDiffCollectorSettings, 
+        CompressionLevel, EnhancedStateDiff, diff::AccessType, DiffEncoder
+    },
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
 use hashbrown::{HashMap, HashSet};
@@ -14,7 +17,9 @@ use super::BlockBuilderError;
 use super::ordering::OrderedTransaction;
 use log::{debug, error, info};
 use crate::evm::SlotKey;
+use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct WasiSimulator {
     gas_used: u64,
     
@@ -31,6 +36,10 @@ pub struct WasiSimulator {
     coinbase_profit: U256,
     
     state_trace: UsedStateTrace,
+    
+    build_id: Option<String>,
+    
+    state_diff_chunks: HashMap<String, Vec<EnhancedStateDiff>, StdRandomState>,
 }
 
 impl WasiSimulator {
@@ -44,7 +53,32 @@ impl WasiSimulator {
             created_contracts: Vec::new(),
             coinbase_profit: U256::ZERO,
             state_trace: UsedStateTrace::default(),
+            build_id: None,
+            state_diff_chunks: HashMap::with_hasher(StdRandomState::new()),
         }
+    }
+    
+    fn generate_build_id(&mut self) -> String {
+        let build_id = format!("build-{}", Uuid::new_v4());
+        self.build_id = Some(build_id.clone());
+        build_id
+    }
+    
+    fn store_state_diff_chunks(&mut self, build_id: &str, chunks: &[EnhancedStateDiff]) {
+        if chunks.is_empty() {
+            return;
+        }
+        
+        self.state_diff_chunks.insert(build_id.to_string(), chunks.to_vec());
+    }
+    
+    pub fn get_state_diff_chunk(&self, build_id: &str, chunk_id: u32) -> Option<EnhancedStateDiff> {
+        if let Some(chunks) = self.state_diff_chunks.get(build_id) {
+            if (chunk_id as usize) < chunks.len() {
+                return Some(chunks[chunk_id as usize].clone());
+            }
+        }
+        None
     }
     
     pub fn gas_used(&self) -> u64 {
@@ -212,8 +246,14 @@ impl WasiSimulator {
         Ok((included_txs, receipts))
     }
     
-    pub fn calculate_state_diff(&self, state: &WasiStateProvider) -> Result<SerializedStateDiff, BlockBuilderError> {
-        let mut state_diff = SerializedStateDiff {
+    pub fn calculate_state_diff(
+        &mut self, 
+        state: &WasiStateProvider,
+        include_complete_diff: bool,
+        include_proofs: bool,
+        compression_level: CompressionLevel,
+    ) -> Result<(SerializedStateDiff, Option<EnhancedStateDiff>, Option<ChunkInfo>, Option<String>), BlockBuilderError> {
+        let mut basic_state_diff = SerializedStateDiff {
             accounts: Vec::new(),
             storage: Vec::new(),
             code: Vec::new(),
@@ -243,6 +283,18 @@ impl WasiSimulator {
             accounts_to_check.insert(*address);
         }
         
+        let mut collector = None;
+        if include_complete_diff {
+            let settings = StateDiffCollectorSettings {
+                include_read_only: true,
+                include_proofs,
+                compression_level,
+                max_diff_size: 10 * 1024 * 1024, 
+                max_entries_per_chunk: 5000,      
+            };
+            collector = Some(StateDiffCollector::new(settings));
+        }
+        
         for address in accounts_to_check {
             if let Some(account_info) = state.account_info(address) {
                 let old_balance = self.state_trace.read_balances.get(&address).cloned();
@@ -256,17 +308,37 @@ impl WasiSimulator {
                     old_code_hash: None,
                     new_code_hash: Some(account_info.code_hash),
                 };
-                state_diff.accounts.push(account_diff);
+                basic_state_diff.accounts.push(account_diff);
                 
-                if let Some(bytecode) = account_info.code {
+                if let Some(bytecode) = account_info.code.clone() {
                     if !bytecode.is_empty() {
-                        if !state_diff.code.iter().any(|c| c.hash == account_info.code_hash) {
-                            state_diff.code.push(SerializedCodeDiff {
+                        if !basic_state_diff.code.iter().any(|c| c.hash == account_info.code_hash) {
+                            basic_state_diff.code.push(SerializedCodeDiff {
                                 hash: account_info.code_hash,
                                 bytecode: bytecode.bytecode().clone(),
                             });
+                            
+                            if let Some(collector) = &mut collector {
+                                collector.record_code_change(
+                                    account_info.code_hash, 
+                                    bytecode.bytecode().clone(),
+                                    self.state_trace.created_contracts.contains(&address)
+                                );
+                            }
                         }
                     }
+                }
+                
+                if let Some(collector) = &mut collector {
+                    if self.state_trace.created_contracts.contains(&address) {
+                        collector.record_account_create(&address, &revm::primitives::CreateScheme::Create, account_info);
+                    } else if self.state_trace.read_balances.contains_key(&address) {
+                        collector.record_account_update(&address, account_info);
+                    }
+                }
+            } else if self.state_trace.destroyed_contracts.contains(&address) {
+                if let Some(collector) = &mut collector {
+                    collector.record_account_delete(&address);
                 }
             }
         }
@@ -274,24 +346,50 @@ impl WasiSimulator {
         for (slot_key, old_value) in &self.state_trace.read_slots {
             if let Some(new_value) = self.state_trace.written_slots.get(slot_key) {
                 if old_value != new_value {
-                    state_diff.storage.push(SerializedStorageDiff {
+                    basic_state_diff.storage.push(SerializedStorageDiff {
                         address: slot_key.address,
                         slot: slot_key.key,
                         old_value: *old_value,
                         new_value: *new_value,
                     });
+                    
+                    if let Some(collector) = &mut collector {
+                        collector.record_storage_update(
+                            &slot_key.address,
+                            slot_key.key,
+                            *new_value,
+                            *old_value
+                        );
+                    }
+                } else {
+                    if let Some(collector) = &mut collector {
+                        collector.record_storage_read(
+                            &slot_key.address,
+                            slot_key.key,
+                            *old_value
+                        );
+                    }
                 }
             }
         }
         
         for (slot_key, new_value) in &self.state_trace.written_slots {
             if !self.state_trace.read_slots.contains_key(slot_key) {
-                state_diff.storage.push(SerializedStorageDiff {
+                basic_state_diff.storage.push(SerializedStorageDiff {
                     address: slot_key.address,
                     slot: slot_key.key,
                     old_value: B256::ZERO,
                     new_value: *new_value,
                 });
+                
+                if let Some(collector) = &mut collector {
+                    collector.record_storage_update(
+                        &slot_key.address,
+                        slot_key.key,
+                        *new_value,
+                        B256::ZERO
+                    );
+                }
             }
         }
         
@@ -306,14 +404,61 @@ impl WasiSimulator {
             }
             
             let value = state.storage_value(*address, *slot);
-            state_diff.storage.push(SerializedStorageDiff {
+            
+            basic_state_diff.storage.push(SerializedStorageDiff {
                 address: *address,
                 slot: *slot,
                 old_value: B256::ZERO,
                 new_value: value,
             });
+            
+            if let Some(collector) = &mut collector {
+                collector.record_storage_read(
+                    address,
+                    *slot,
+                    value
+                );
+            }
         }
         
-        Ok(state_diff)
+        let mut enhanced_diff = None;
+        let mut chunk_info = None;
+        let mut build_id = None;
+        
+        if let Some(collector) = &collector {
+            let state_root = B256::ZERO;
+            let block_number = 0; 
+            
+            let diff = collector.generate_diff(state, state_root, block_number);
+            
+            if diff.estimated_size() > collector.settings.max_diff_size {
+                debug!("Enhanced state diff is too large ({} bytes), splitting into chunks", 
+                    diff.estimated_size());
+                
+                let chunks = diff.split_into_chunks(collector.settings.max_diff_size);
+                debug!("Split enhanced state diff into {} chunks", chunks.len());
+                
+                if !chunks.is_empty() {
+                    let _build_id = self.generate_build_id();
+                    build_id = self.build_id.clone();
+                    
+                    if let Some(build_id_str) = &build_id {
+                        self.store_state_diff_chunks(build_id_str, &chunks[1..]);
+                    }
+                    
+                    enhanced_diff = Some(chunks[0].clone());
+                    
+                    chunk_info = Some(ChunkInfo {
+                        chunk_id: 0,
+                        total_chunks: chunks.len() as u32,
+                        remaining_chunks_available: chunks.len() > 1,
+                    });
+                }
+            } else {
+                enhanced_diff = Some(diff);
+            }
+        }
+        
+        Ok((basic_state_diff, enhanced_diff, chunk_info, build_id))
     }
 }

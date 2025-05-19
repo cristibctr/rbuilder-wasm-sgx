@@ -577,8 +577,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let wasm_path = if args.len() > 1 && !args[1].starts_with("--") {
         &args[1]
     } else {
-        let wasm32_wasip1_path = "./target/wasm32-wasip1/release/wasm_block_builder.wasm";
-        let wasm32_wasip1_path_debug = "./target/wasm32-wasip1/debug/wasm_block_builder.wasm";
+        let wasm32_wasip1_path = "./target/wasm32-wasip1/release/wasm_block_builder.aot";
+        let wasm32_wasip1_path_debug = "./target/wasm32-wasip1/debug/wasm_block_builder.aot";
         
         if Path::new(wasm32_wasip1_path).exists() {
             wasm32_wasip1_path

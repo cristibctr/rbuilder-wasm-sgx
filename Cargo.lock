@@ -4686,6 +4686,7 @@ dependencies = [
  "ahash",
  "allocator-api2",
  "rayon",
+ "serde",
 ]
 
 [[package]]
@@ -6387,9 +6388,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.169"
+version = "0.2.172"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5aba8db14291edd000dfcc4d620c7ebfb122c613afb886ca8803fa4e128a20a"
+checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
 
 [[package]]
 name = "libgit2-sys"
@@ -7292,6 +7293,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
 dependencies = [
  "smallvec",
+]
+
+[[package]]
+name = "nix"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74523f3a35e05aba87a1d978330aef40f67b0304ac79c1c00b294c9830543db6"
+dependencies = [
+ "bitflags 2.6.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -9389,6 +9402,7 @@ dependencies = [
  "metrics_macros",
  "mev-share-sse",
  "mockall",
+ "nix",
  "once_cell",
  "parking_lot",
  "primitive-types",
@@ -13528,6 +13542,7 @@ version = "0.1.0"
 dependencies = [
  "bindgen 0.69.5",
  "cc",
+ "lazy_static",
  "libc",
  "log",
  "serde",
@@ -15885,6 +15900,7 @@ dependencies = [
  "hashbrown 0.14.5",
  "hex",
  "k256 0.13.4",
+ "lazy_static",
  "log",
  "rand_core 0.6.4",
  "revm",
@@ -15894,6 +15910,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing-subscriber",
+ "uuid",
  "wasmer",
  "wasmer-wasix",
 ]

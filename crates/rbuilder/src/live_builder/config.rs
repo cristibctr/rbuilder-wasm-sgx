@@ -569,7 +569,7 @@ impl Default for Config {
         {
             let workspace_dir = env::var("CARGO_WORKSPACE_DIR").unwrap_or_else(|_| "../".into());
             let wasm_path = Path::new(&workspace_dir)
-                .join("target/wasm32-wasip1/release/wasm_block_builder.wasm");
+                .join("target/wasm32-wasip1/release/wasm_block_builder.aot");
             builders.push(BuilderConfig {
                 name: String::from("sgx-wasm"),
                 builder: SpecificBuilderConfig::SgxWasmBuilder(SgxWasmBuilderConfig {

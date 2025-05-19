@@ -142,6 +142,7 @@ sysperf.workspace = true
 crossbeam = "0.8.4"
 parking_lot.workspace = true
 dashmap = "6.1.0"
+nix = { version = "0.30.1", features = ["process", "signal"] }
 
 
 [build-dependencies]

@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 serde = { version = "1.0.210", features = ["derive", "alloc"], default-features = false }
 thiserror = { version = "1.0.64", default-features = false }
 
-hashbrown = { version = "0.14", default-features = false }
+hashbrown = { version = "0.14", default-features = false, features = ["serde"] }
 
 alloy-primitives = { workspace = true, features = ["serde", "rand"] } # Inherit from workspace, add serde
 alloy-rlp.workspace = true
@@ -35,6 +35,8 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 
 log = { version = "0.4", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+lazy_static = "1.4.0"
+uuid = { version = "1.7.0", features = ["v4", "serde"] }
 
 [features]
 default = []

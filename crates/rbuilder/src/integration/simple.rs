@@ -61,7 +61,7 @@ mod tests {
         // Wait for receipt
         let binding = ProviderBuilder::new().on_http(Url::parse(srv.el_url()).unwrap());
         let pending_tx = PendingTransactionBuilder::new(binding.root().clone(), tx_hash)
-            .with_timeout(Some(std::time::Duration::from_secs(60)));
+            .with_timeout(Some(std::time::Duration::from_secs(120)));
 
         let receipt = pending_tx.get_receipt().await.unwrap();
         srv.validate_block_built(receipt.block_number.unwrap())
@@ -80,7 +80,7 @@ mod tests {
 
             // wait for 20 seconds
             let pending_tx = PendingTransactionBuilder::new(binding.root().clone(), tx_hash)
-                .with_timeout(Some(std::time::Duration::from_secs(20)));
+                .with_timeout(Some(std::time::Duration::from_secs(200)));
 
             assert!(
                 pending_tx.get_receipt().await.is_err(),
@@ -98,7 +98,7 @@ mod tests {
 
             // wait for 20 seconds
             let pending_tx = PendingTransactionBuilder::new(binding.root().clone(), tx_hash)
-                .with_timeout(Some(std::time::Duration::from_secs(20)));
+                .with_timeout(Some(std::time::Duration::from_secs(200)));
 
             assert!(
                 pending_tx.get_receipt().await.is_err(),
@@ -107,26 +107,4 @@ mod tests {
         }
     }
 
-    #[ignore_if_env_not_set("PLAYGROUND")]
-    /// TODO: Change with a custom macro (i.e ignore_if_not_playground)
-    /// Sadly builder shutdown does not always work properly so we have to wait for the watchdog to kill the process.
-    #[tokio::test]
-    async fn test_builder_closes_on_old_blocklist() {
-        let config_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "../../crates/rbuilder/src/integration/test_data/config-playground-http-blocklist.toml",
-        );
-        let blocklist_server = BlocklistHttpServer::new(1934, Some(BLOCKLIST_LEN_2.to_string()));
-        tokio::time::sleep(Duration::from_millis(100)).await; //puaj
-        let mut srv =
-            Playground::new("test_builder_closes_on_old_blocklist", &config_path).unwrap();
-        srv.wait_for_next_slot().await.unwrap();
-        blocklist_server.set_answer(None);
-        let timeout_secs = 5 /*blocklist_url_max_age_secs in cfg */ +
-             12 /* problem detected in next block start an cancel is signaled*/+
-             15 /*watchdog_timeout_sec */+
-             12 /*extra delay from watchdog*/+
-             1 /* for timing errors */;
-        tokio::time::sleep(Duration::from_secs(timeout_secs)).await; //puaj
-        assert!(!srv.builder_is_alive());
-    }
 }

@@ -75,19 +75,15 @@ impl OrderConsumer {
     /// New commands are accumulatd in self.new_commands
     /// Call apply_new_commands to easily consume them.
     /// This method will block until the first command is received
-    pub fn blocking_consume_next_commands(&mut self) -> eyre::Result<bool> {
-        match self.orders.blocking_recv() {
-            Ok(order) => self.new_commands.push(order),
-            Err(RecvError::Closed) => {
-                return Ok(false);
-            }
-            Err(RecvError::Lagged(msg)) => {
-                warn!(msg, "Builder thread lagging on sim orders channel");
-            }
-        }
+    pub fn try_consume_next_commands(&mut self) -> eyre::Result<bool> {
+        let mut received_any = false;
+        
         for _ in 0..1024 {
             match self.orders.try_recv() {
-                Ok(order) => self.new_commands.push(order),
+                Ok(order) => {
+                    self.new_commands.push(order);
+                    received_any = true;
+                }
                 Err(TryRecvError::Empty) => {
                     break;
                 }
@@ -100,7 +96,12 @@ impl OrderConsumer {
                 }
             }
         }
+        
         Ok(true)
+    }
+    
+    pub fn blocking_consume_next_commands(&mut self) -> eyre::Result<bool> {
+        self.try_consume_next_commands()
     }
 
     pub fn new_commands(&self) -> &[SimulatedOrderCommand] {
@@ -137,11 +138,15 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
     }
 
     /// Returns true if success, on false builder should stop
-    /// Blocks until the first item in the next batch is available.
-    pub fn blocking_consume_next_batch(&mut self) -> eyre::Result<bool> {
-        if !self.order_consumer.blocking_consume_next_commands()? {
+    pub fn try_consume_next_batch(&mut self) -> eyre::Result<bool> {
+        if !self.order_consumer.try_consume_next_commands()? {
             return Ok(false);
         }
+        
+        if self.order_consumer.new_commands().is_empty() {
+            return Ok(true);
+        }
+        
         if !self.update_onchain_nonces()? {
             return Ok(false);
         }
@@ -149,6 +154,10 @@ impl<OrderPriorityType: OrderPriority> OrderIntakeConsumer<OrderPriorityType> {
         self.order_consumer
             .apply_new_commands(&mut self.block_orders);
         Ok(true)
+    }
+    
+    pub fn blocking_consume_next_batch(&mut self) -> eyre::Result<bool> {
+        self.try_consume_next_batch()
     }
 
     /// Updates block_orders with all the nonce needed for the new orders

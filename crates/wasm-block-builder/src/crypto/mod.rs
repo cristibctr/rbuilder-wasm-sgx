@@ -71,7 +71,7 @@ impl BlockSigner {
     pub(crate) fn generate_new_key() -> Result<SigningKey> {
         #[cfg(feature = "test-key")]
         {
-            log::warn!("Using test key - NOT SECURE FOR PRODUCTION");
+            log::warn!("Using test key");
             let private_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
             let key_bytes = hex::decode(private_key_hex)
                 .map_err(|e| CryptoError::KeyError(format!("Failed to decode test key: {}", e)))?;

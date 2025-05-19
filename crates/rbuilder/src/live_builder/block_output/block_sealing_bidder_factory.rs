@@ -104,10 +104,13 @@ where
             self.competition_bid_value_source.clone(),
             cancel.clone(),
         );
+        tracing::info!("Creating SequentialSealerBidMaker for slot data: block={}, slot={}, PLAYGROUND={:?}", 
+            slot_data.block(), slot_data.slot(), std::env::var("PLAYGROUND").ok());
         let sealer = Box::new(SequentialSealerBidMaker::new(
             Arc::from(finished_block_sink),
             cancel.clone(),
         ));
+        tracing::info!("Created SequentialSealerBidMaker");
 
         let slot_bidder: Arc<dyn SlotBidder> = self.bidding_service.create_slot_bidder(
             slot_data.block(),

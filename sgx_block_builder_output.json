@@ -22,16 +22,16 @@
     "blob_count": 0,
     "blob_gas_used": 0,
     "block_value": "0x1319718a5000",
-    "build_time_us": 1962,
+    "build_time_us": 101,
     "gas_used": 21000,
     "trace": {
-      "finalize_time_us": 34,
-      "ordering_time_us": 628,
+      "finalize_time_us": 3,
+      "ordering_time_us": 51,
       "orders_considered": 1,
       "orders_failed": 0,
       "orders_included": 1,
-      "root_hash_time_us": 62,
-      "sim_time_us": 1220
+      "root_hash_time_us": 3,
+      "sim_time_us": 37
     },
     "tx_count": 1
   },
@@ -44,7 +44,7 @@
       "tx_type": 0
     }
   ],
-  "signature": "0x8cb694301669856237e06b53d6a7755c59e5a0dee098135e6f01b6328839a1f84c9ac9b8834d583252755d0276fbb6851fb3b601df702da661ac151f018d574a",
+  "signature": "0xccc074e30226e1d35703f4a20a503cb4fcb7fe4bc1f245904cdc6e107f1b830d4e5cc57c3d7615f5b468564b4faaf60b02885264c35c87f68be29dc9116cf23c",
   "state_diff": {
     "accounts": [
       {

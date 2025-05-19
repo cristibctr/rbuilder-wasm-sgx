@@ -62,6 +62,10 @@ impl Bid {
     pub fn seen_competition_bid(&self) -> Option<U256> {
         self.seen_competition_bid
     }
+    
+    pub fn view_block(&self) -> &BiddableUnfinishedBlock {
+        &self.block
+    }
 }
 
 /// Makes the actual bid (seal + send it to the relay).

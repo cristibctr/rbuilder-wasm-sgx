@@ -44,14 +44,25 @@ pub struct PendingBlockCell {
 impl PendingBlockCell {
     /// Updates unless it's exactly the same block (hash)
     pub fn update(&self, block: Block) {
+        let block_number = block.sealed_block.number;
+        let block_hash = block.sealed_block.hash();
+        
+        tracing::info!("PendingBlockCell.update() - Updating block number {} with hash {:?}", block_number, block_hash);
+        
         let mut current_block = self.block.lock();
         let old_block_hash = current_block
             .as_ref()
             .map(|b| b.sealed_block.hash())
             .unwrap_or_default();
+            
+        tracing::info!("PendingBlockCell.update() - Old block hash: {:?}, new block hash: {:?}", old_block_hash, block_hash);
+        
         if block.sealed_block.hash() != old_block_hash {
             *current_block = Some(block);
+            tracing::info!("PendingBlockCell.update() - Block updated, calling notify_one()");
             self.block_notify.notify_one();
+        } else {
+            tracing::info!("PendingBlockCell.update() - Block hash unchanged, not calling notify_one()");
         }
     }
 
@@ -60,7 +71,9 @@ impl PendingBlockCell {
     }
 
     pub async fn wait_for_change(&self) {
-        self.block_notify.notified().await
+        tracing::info!("PendingBlockCell.wait_for_change() - About to wait for notification");
+        self.block_notify.notified().await;
+        tracing::info!("PendingBlockCell.wait_for_change() - Notification received");
     }
 }
 
@@ -72,7 +85,10 @@ struct PendingBlockCellToBlockBuildingSink {
 
 impl BlockBuildingSink for PendingBlockCellToBlockBuildingSink {
     fn new_block(&self, block: Block) {
+        tracing::info!("PendingBlockCellToBlockBuildingSink.new_block() called with block number {}", 
+                    block.sealed_block.number);
         self.pending_block_cell.update(block);
+        tracing::info!("PendingBlockCellToBlockBuildingSink.new_block() - Updated pending block cell");
     }
 }
 
