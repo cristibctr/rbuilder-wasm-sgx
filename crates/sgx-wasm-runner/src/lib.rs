@@ -7,7 +7,7 @@ use std::ptr;
 use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use log::{debug, error, warn};
 
 lazy_static::lazy_static! {
@@ -108,32 +108,95 @@ impl TryFrom<wamr_sgx_val_t> for Value {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct WasmModule {
+#[derive(Debug)]
+struct WasmModuleInner {
     module: *mut WamrSgxModule,
     instance: *mut WamrSgxInstance,
 }
 
-unsafe impl Send for WasmModule {}
-unsafe impl Sync for WasmModule {}
+unsafe impl Send for WasmModuleInner {}
+unsafe impl Sync for WasmModuleInner {}
 
-impl Drop for WasmModule {
+impl WasmModuleInner {
+    unsafe fn get_instance_context(&self) -> *mut WamrSgxContext {
+        if self.instance.is_null() {
+            return std::ptr::null_mut();
+        }
+        
+        let context_ptr_addr = self.instance as usize;
+        let context_ptr = *(context_ptr_addr as *const *mut WamrSgxContext);
+        context_ptr
+    }
+    
+    unsafe fn set_instance_context(&self, ctx: *mut WamrSgxContext) {
+        if self.instance.is_null() {
+            return;
+        }
+        
+        let context_ptr_addr = self.instance as usize;
+        *(context_ptr_addr as *mut *mut WamrSgxContext) = ctx;
+    }
+    
+    unsafe fn get_module_context(&self) -> *mut WamrSgxContext {
+        if self.module.is_null() {
+            return std::ptr::null_mut();
+        }
+        
+        let context_ptr_addr = self.module as usize;
+        let context_ptr = *(context_ptr_addr as *const *mut WamrSgxContext);
+        context_ptr
+    }
+    
+    unsafe fn set_module_context(&self, ctx: *mut WamrSgxContext) {
+        if self.module.is_null() {
+            return;
+        }
+        
+        let context_ptr_addr = self.module as usize;
+        *(context_ptr_addr as *mut *mut WamrSgxContext) = ctx;
+    }
+}
+
+impl Drop for WasmModuleInner {
     fn drop(&mut self) {
+        debug!("[SGX Cleanup] Dropping WasmModuleInner, all references are gone");
         unsafe {
             if !self.instance.is_null() {
                 debug!("[SGX Cleanup] Destroying WASM instance: {:p}", self.instance);
+
+                let instance_ctx = self.get_instance_context();
+                if instance_ctx != SGX_CONTEXT {
+                    debug!("[SGX Fix] Fixing instance context mismatch before destroying instance");
+                    self.set_instance_context(SGX_CONTEXT);
+                }
+                
                 wamr_sgx_destroy_instance(SGX_CONTEXT, self.instance);
                 self.instance = std::ptr::null_mut();
             }
             
             if !self.module.is_null() {
                 debug!("[SGX Cleanup] Unloading WASM module: {:p}", self.module);
+
+                let module_ctx = self.get_module_context();
+                if module_ctx != SGX_CONTEXT {
+                    debug!("[SGX Fix] Fixing module context mismatch before unloading module");
+                    self.set_module_context(SGX_CONTEXT);
+                }
+                
                 wamr_sgx_unload_module(SGX_CONTEXT, self.module);
                 self.module = std::ptr::null_mut();
             }
         }
     }
 }
+
+#[derive(Clone, Debug)]
+pub struct WasmModule {
+    inner: Arc<WasmModuleInner>,
+}
+
+unsafe impl Send for WasmModule {}
+unsafe impl Sync for WasmModule {}
 
 impl WasmModule {
     pub fn new<P: AsRef<Path>>(wasm_path: P) -> Result<Self, Error> {
@@ -257,9 +320,13 @@ impl WasmModule {
             
             return Err(Error::ModuleLoadFailed(result));
         }
+
+        let inner = WasmModuleInner {
+            module,
+            instance,
+        };
         
-        
-        Ok(Self { module, instance })
+        Ok(Self { inner: Arc::new(inner) })
     }
     
     pub fn call_function(&self, name: &str, args: &[Value]) -> Result<Vec<Value>, Error> {
@@ -285,12 +352,21 @@ impl WasmModule {
                 value: wamr_sgx_val_t__bindgen_ty_1 { i32_: 0 },
             });
         }
-        
+
+        unsafe {
+            if !self.inner.instance.is_null() {
+                let instance_ctx = self.inner.get_instance_context();
+                if instance_ctx != SGX_CONTEXT {
+                    debug!("[SGX Fix] Fixing instance context mismatch before function call to {}", name);
+                    self.inner.set_instance_context(SGX_CONTEXT);
+                }
+            }
+        }
         
         let result = unsafe {
             wamr_sgx_call_function(
                 SGX_CONTEXT,
-                self.instance,
+                self.inner.instance,
                 name_c.as_ptr(),
                 wamr_args.as_ptr(),
                 wamr_args.len(),
@@ -472,7 +548,7 @@ impl WasmModule {
         let alloc_result = unsafe {
             wamr_sgx_call_function(
                 SGX_CONTEXT,
-                self.instance,
+                self.inner.instance,
                 alloc_name_c.as_ptr(),
                 &mut alloc_arg,
                 1,
@@ -566,13 +642,21 @@ impl WasmModule {
         let mut arg_buf  = [wamr_sgx_val_t::default(); 2];
         arg_buf[1].value.i32_ = 0i32;
 
+        unsafe {
+            let instance_ctx = self.inner.get_instance_context();
+            if !self.inner.instance.is_null() && instance_ctx != SGX_CONTEXT {
+                debug!("[SGX Fix] Fixing instance context mismatch before read_memory_bytes");
+                self.inner.set_instance_context(SGX_CONTEXT);
+            }
+        }
+
         for i in 0..size {
             arg_buf[0].value.i32_ = (offset + i) as i32;
 
             let read_result = unsafe {
                 wamr_sgx_call_function(
                     SGX_CONTEXT,
-                    self.instance,
+                    self.inner.instance,
                     get_byte_name_c.as_ptr(),
                     &mut arg_buf[0],
                     1,
@@ -738,7 +822,7 @@ impl BlockBuilderSgx {
         let module = WasmModule::new(wasm_path)?;
         let module_info = Self::get_module_info_internal(&module)?;
         
-        log::info!("SGX WASM module initialized successfully");
+        log::info!("SGX WASM module initialized successfully with Arc protection");
         log::debug!("Module info: {}", module_info);
         
         Ok(Self { module })
