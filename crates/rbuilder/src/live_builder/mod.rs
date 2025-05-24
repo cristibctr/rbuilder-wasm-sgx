@@ -64,7 +64,7 @@ impl TimingsConfig {
     /// Classic rbuilder
     pub fn ethereum() -> Self {
         Self {
-            slot_proposal_duration: Duration::from_secs(4),
+            slot_proposal_duration: Duration::from_secs(10),
             block_header_deadline_delta: time::Duration::milliseconds(-2500),
             get_block_header_period: time::Duration::milliseconds(250),
         }

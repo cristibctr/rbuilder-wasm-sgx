@@ -117,6 +117,7 @@ impl AccountChangeTracker {
             code_hash: None,
             status: self.status(),
             storage_root: None,
+            proof: None,
         };
         
         match (&self.original, &self.current) {
@@ -421,6 +422,7 @@ impl StateDiffCollector {
                 address: *address,
                 slot_changes: Vec::new(),
                 read_only_slots: None,
+                proofs: None,
             };
             
             for (slot, tracker) in slots {
@@ -491,6 +493,7 @@ impl StateDiffCollector {
                         address: *address,
                         slot_changes: Vec::new(),
                         read_only_slots: Some(read_only_slots),
+                        proofs: None,
                     });
                 }
             }
@@ -539,7 +542,7 @@ impl StateDiffCollector {
             }
             
             if !storage_proofs.is_empty() {
-                storage_diff.proofs = Some(storage_proofs);
+                storage_diff.proofs = Some(storage_proofs.into_iter().collect());
             }
         }
         

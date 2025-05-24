@@ -24,6 +24,9 @@ pub struct UsedStateTrace {
     pub received_amount: HashMap<Address, U256, StdRandomState>,
     pub sent_amount: HashMap<Address, U256, StdRandomState>,
     
+    pub read_nonces: HashMap<Address, u64, StdRandomState>,
+    pub written_nonces: HashMap<Address, u64, StdRandomState>,
+    
     pub created_contracts: Vec<Address>,
     
     pub destroyed_contracts: Vec<Address>,
@@ -46,6 +49,15 @@ impl UsedStateTrace {
             }
             self.read_balances.insert(*address, *balance);
         }
+
+        for (address, nonce) in &other.read_nonces {
+            if self.read_nonces.contains_key(address) {
+                continue;
+            }
+            self.read_nonces.insert(*address, *nonce);
+        }
+
+        self.written_nonces.extend(other.written_nonces.clone());
 
         for (address, received_amount) in &other.received_amount {
             *self.received_amount.entry(*address).or_default() += received_amount;
@@ -71,6 +83,8 @@ impl UsedStateTrace {
         self.read_balances.clear();
         self.received_amount.clear();
         self.sent_amount.clear();
+        self.read_nonces.clear();
+        self.written_nonces.clear();
         self.created_contracts.clear();
         self.destroyed_contracts.clear();
     }
@@ -99,20 +113,9 @@ impl<'a> WasiEVMInspector<'a> {
     }
     
     pub fn track_tx_nonce(&mut self, from: Address, nonce: u64) {
-        self.state_trace.read_slots.insert(
-            SlotKey {
-                address: from,
-                key: Default::default(),
-            },
-            U256::from(nonce).into(),
-        );
-        self.state_trace.written_slots.insert(
-            SlotKey {
-                address: from,
-                key: Default::default(),
-            },
-            U256::from(nonce + 1).into(),
-        );
+        self.state_trace.read_nonces.insert(from, nonce);
+        self.state_trace.written_nonces.insert(from, nonce + 1);
+        
     }
 }
 

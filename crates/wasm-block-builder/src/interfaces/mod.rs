@@ -7,10 +7,10 @@ pub use input::{
     BlockBuilderConfig, BlockBuilderInput, BlockParams, SerializedAccount, SerializedBundle,
     SerializedCode, SerializedStorage, SerializedTransaction, StateProviderInput,
 };
-pub use output::{
-    AccountDiff, BlockBuilderOutput, BlockMetrics, SerializedBuildTrace, SerializedHeader, SerializedLog,
+pub use block_builder_types::{
+    AccountDiff, BlockBuilderOutput, BlockMetrics, SerializedBuildTrace, SerializedLog,
     SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, StorageDiff, SerializedStorageDiff,
-    SerializedCodeDiff,
+    SerializedCodeDiff, ChunkInfo,
 };
 
 pub mod input;

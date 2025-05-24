@@ -1,20 +1,53 @@
 mod ordering;
 mod simulator;
 
-use crate::{
-    interfaces::{
-        input::{BlockBuilderConfig, BlockParams, SerializedBundle, SerializedTransaction},
-        output::{BlockBuilderOutput, BlockMetrics, SerializedBuildTrace},
-    },
-    state::WasiStateProvider,
-};
+use crate::{interfaces::{
+    input::{BlockBuilderConfig, BlockParams, SerializedBundle, SerializedTransaction},
+    output::{BlockBuilderOutput, BlockMetrics, SerializedBuildTrace},
+}, sgx_log, state::WasiStateProvider};
+use alloy_consensus::Header;
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_consensus::proofs::{calculate_transaction_root, calculate_receipt_root};
+use alloy_eips::eip2718::Typed2718;
 use std::time::Instant;
 use thiserror::Error;
 use crate::state::CompressionLevel;
 use self::ordering::WasiOrderSorter;
 
 pub use self::simulator::WasiSimulator;
+
+#[derive(Clone)]
+struct TxWrapper(Bytes);
+
+impl alloy_eips::eip2718::Typed2718 for TxWrapper {
+    fn ty(&self) -> u8 {
+        if self.0.is_empty() {
+            0
+        } else {
+            match self.0[0] {
+                1 | 2 | 3 => self.0[0],
+                _ => 0,
+            }
+        }
+    }
+}
+
+impl alloy_eips::eip2718::Encodable2718 for TxWrapper {
+    fn type_flag(&self) -> Option<u8> {
+        match self.ty() {
+            0 => None,
+            ty => Some(ty),
+        }
+    }
+    
+    fn encode_2718_len(&self) -> usize {
+        self.0.len()
+    }
+    
+    fn encode_2718(&self, out: &mut dyn alloy_rlp::BufMut) {
+        out.put_slice(&self.0);
+    }
+}
 
 #[derive(Error, Debug)]
 pub enum BlockBuilderError {
@@ -75,7 +108,10 @@ impl WasiBlockBuilder {
         let build_start = Instant::now();
         
         let orders_considered = transactions.len() + bundles.len();
-        log::info!("Sorting {} transactions and {} bundles", transactions.len(), bundles.len());
+        let error_msg = format!("Sorting {} transactions and {} bundles", transactions.len(), bundles.len());
+        log::info!("{}", error_msg);
+        sgx_log(&error_msg);
+
         
         let ordering_start = Instant::now();
         let ordered_txs = self.sorter.sort_transactions(
@@ -85,7 +121,10 @@ impl WasiBlockBuilder {
         )?;
         let ordering_time = ordering_start.elapsed();
         
-        log::info!("Simulating transactions for block building");
+        let error_msg = format!("Simulating transactions for block building");
+        log::info!("{}", error_msg);
+        sgx_log(&error_msg);
+
         let sim_start = Instant::now();
         let (included_txs, receipts) = self.simulator.simulate_and_build(
             &mut self.state,
@@ -112,7 +151,7 @@ impl WasiBlockBuilder {
             compression_level
         )?;
         
-        let state_root = None;
+        let state_root: Option<B256> = None;
         let root_hash_time = root_hash_start.elapsed();
         
         let finalize_start = Instant::now();
@@ -123,292 +162,28 @@ impl WasiBlockBuilder {
         let tx_bytes: Vec<Bytes> = included_txs
             .iter()
             .map(|tx| {
-                let chain_id = 1u64;
-                
-                match tx.tx_type {
-                    crate::interfaces::input::TxType::Legacy => {
-                        let mut buffer = Vec::new();
-                        
-                        let r = tx.hash;
-                        let s = B256::from_slice(&tx.hash.0[0..32]);
-                        
-                        let v = 27u64 + (chain_id * 2) + 35;
-                        
-                        let mut data = Vec::new();
-                        
-                        tx.nonce.encode(&mut data);
-                        tx.gas_price.encode(&mut data);
-                        tx.gas_limit.encode(&mut data);
-                        match tx.to {
-                            Some(to) => to.encode(&mut data),
-                            None => Bytes::new().encode(&mut data),
-                        }
-                        tx.value.encode(&mut data);
-                        tx.input.as_ref().encode(&mut data);
-                        v.encode(&mut data);
-                        r.encode(&mut data);
-                        s.encode(&mut data);
-                        
-                        let list_header = alloy_rlp::Header {
-                            list: true,
-                            payload_length: data.len()
-                        };
-                        list_header.encode(&mut buffer);
-                        buffer.extend_from_slice(&data);
-                        
-                        Bytes::from(buffer)
-                    },
-                    
-                    crate::interfaces::input::TxType::AccessList => {
-                        let mut buffer = Vec::new();
-                        buffer.push(tx.tx_type as u8);
-                        
-                        let r = tx.hash;
-                        let s = B256::from_slice(&tx.hash.0[0..32]);
-                        let v = 1u64;
-                        
-                        let mut rlp_data = Vec::new();
-                        
-                        chain_id.encode(&mut rlp_data);
-                        tx.nonce.encode(&mut rlp_data);
-                        tx.gas_price.encode(&mut rlp_data);
-                        tx.gas_limit.encode(&mut rlp_data);
-                        
-                        match tx.to {
-                            Some(to) => to.encode(&mut rlp_data),
-                            None => Bytes::new().encode(&mut rlp_data),
-                        }
-                        
-                        tx.value.encode(&mut rlp_data);
-                        tx.input.as_ref().encode(&mut rlp_data);
-                        
-                        let mut access_list_rlp = Vec::new();
-                        for entry in &tx.access_list {
-                            let mut entry_rlp: Vec<u8> = Vec::new();
-                            
-
-                            let mut entry_buffer = Vec::new();
-                            
-                            let header = alloy_rlp::Header { list: true, payload_length: 0 };
-                            
-                            entry.address.encode(&mut entry_buffer);
-                            
-                            let slots_header = alloy_rlp::Header { list: true, payload_length: 0 };
-                            let mut slots_buffer = Vec::new();
-                            
-                            for slot in &entry.slots {
-                                slot.encode(&mut slots_buffer);
-                            }
-                            
-                            let slots_header = alloy_rlp::Header {
-                                list: true, 
-                                payload_length: slots_buffer.len() 
-                            };
-                            slots_header.encode(&mut entry_buffer);
-                            entry_buffer.extend_from_slice(&slots_buffer);
-                            
-                            let entry_header = alloy_rlp::Header {
-                                list: true,
-                                payload_length: entry_buffer.len()
-                            };
-                            entry_header.encode(&mut access_list_rlp);
-                            access_list_rlp.extend_from_slice(&entry_buffer);
-                        }
-                        
-                        let access_list_header = alloy_rlp::Header {
-                            list: true,
-                            payload_length: access_list_rlp.len()
-                        };
-                        access_list_header.encode(&mut rlp_data);
-                        rlp_data.extend_from_slice(&access_list_rlp);
-                        
-                        v.encode(&mut rlp_data);
-                        r.encode(&mut rlp_data);
-                        s.encode(&mut rlp_data);
-                        
-                        let mut final_buffer = Vec::new();
-                        alloy_rlp::Header { list: true, payload_length: rlp_data.len() }.encode(&mut final_buffer);
-                        final_buffer.extend_from_slice(&rlp_data);
-                        
-                        buffer.extend_from_slice(&final_buffer);
-                        Bytes::from(buffer)
-                    },
-                    
-                    crate::interfaces::input::TxType::EIP1559 => {
-                        let mut buffer = Vec::new();
-                        buffer.push(tx.tx_type as u8);
-                        
-                        let max_priority_fee = tx.max_priority_fee_per_gas.unwrap_or(U256::ZERO);
-                        
-                        let r = tx.hash;
-                        let s = B256::from_slice(&tx.hash.0[0..32]);
-                        let v = 1u64;
-                        
-                        let mut rlp_data = Vec::new();
-                        
-                        chain_id.encode(&mut rlp_data);
-                        tx.nonce.encode(&mut rlp_data);
-                        max_priority_fee.encode(&mut rlp_data);
-                        tx.gas_price.encode(&mut rlp_data);
-                        tx.gas_limit.encode(&mut rlp_data);
-                        
-                        match tx.to {
-                            Some(to) => to.encode(&mut rlp_data),
-                            None => Bytes::new().encode(&mut rlp_data),
-                        }
-                        
-                        tx.value.encode(&mut rlp_data);
-                        tx.input.as_ref().encode(&mut rlp_data);
-                        
-                        let mut access_list_rlp = Vec::new();
-                        for entry in &tx.access_list {
-                            let mut entry_rlp: Vec<u8> = Vec::new();
-                            
-
-                            let mut entry_buffer = Vec::new();
-                            
-                            let header = alloy_rlp::Header { list: true, payload_length: 0 };
-                            
-                            entry.address.encode(&mut entry_buffer);
-                            
-                            let slots_header = alloy_rlp::Header { list: true, payload_length: 0 };
-                            let mut slots_buffer = Vec::new();
-                            
-                            for slot in &entry.slots {
-                                slot.encode(&mut slots_buffer);
-                            }
-                            
-                            let slots_header = alloy_rlp::Header {
-                                list: true, 
-                                payload_length: slots_buffer.len() 
-                            };
-                            slots_header.encode(&mut entry_buffer);
-                            entry_buffer.extend_from_slice(&slots_buffer);
-                            
-                            let entry_header = alloy_rlp::Header {
-                                list: true,
-                                payload_length: entry_buffer.len()
-                            };
-                            entry_header.encode(&mut access_list_rlp);
-                            access_list_rlp.extend_from_slice(&entry_buffer);
-                        }
-                        
-                        let access_list_header = alloy_rlp::Header {
-                            list: true,
-                            payload_length: access_list_rlp.len()
-                        };
-                        access_list_header.encode(&mut rlp_data);
-                        rlp_data.extend_from_slice(&access_list_rlp);
-                        
-                        v.encode(&mut rlp_data);
-                        r.encode(&mut rlp_data);
-                        s.encode(&mut rlp_data);
-                        
-                        let mut final_buffer = Vec::new();
-                        alloy_rlp::Header { list: true, payload_length: rlp_data.len() }.encode(&mut final_buffer);
-                        final_buffer.extend_from_slice(&rlp_data);
-                        
-                        buffer.extend_from_slice(&final_buffer);
-                        Bytes::from(buffer)
-                    },
-                    
-                    crate::interfaces::input::TxType::Blob => {
-                        let mut buffer = Vec::new();
-                        buffer.push(tx.tx_type as u8);
-                        
-                        let max_priority_fee = tx.max_priority_fee_per_gas.unwrap_or(U256::ZERO);
-                        
-                        let max_blob_fee = tx.max_fee_per_blob_gas.unwrap_or(U256::ZERO);
-                        
-                        let r = tx.hash;
-                        let s = B256::from_slice(&tx.hash.0[0..32]);
-                        let v = 1u64;
-                        
-                        let mut rlp_data = Vec::new();
-                        
-                        chain_id.encode(&mut rlp_data);
-                        tx.nonce.encode(&mut rlp_data);
-                        max_priority_fee.encode(&mut rlp_data);
-                        tx.gas_price.encode(&mut rlp_data);
-                        tx.gas_limit.encode(&mut rlp_data);
-                        
-                        match tx.to {
-                            Some(to) => to.encode(&mut rlp_data),
-                            None => Bytes::new().encode(&mut rlp_data),
-                        }
-                        
-                        tx.value.encode(&mut rlp_data);
-                        tx.input.as_ref().encode(&mut rlp_data);
-                        
-                        let mut access_list_rlp = Vec::new();
-                        for entry in &tx.access_list {
-                            let mut entry_rlp: Vec<u8> = Vec::new();
-                            
-                            
-                            let mut entry_buffer = Vec::new();
-                            
-                            let header = alloy_rlp::Header { list: true, payload_length: 0 };
-                            
-                            entry.address.encode(&mut entry_buffer);
-                            
-                            let slots_header = alloy_rlp::Header { list: true, payload_length: 0 };
-                            let mut slots_buffer = Vec::new();
-                            
-                            for slot in &entry.slots {
-                                slot.encode(&mut slots_buffer);
-                            }
-                            
-                            let slots_header = alloy_rlp::Header { 
-                                list: true, 
-                                payload_length: slots_buffer.len() 
-                            };
-                            slots_header.encode(&mut entry_buffer);
-                            entry_buffer.extend_from_slice(&slots_buffer);
-                            
-                            let entry_header = alloy_rlp::Header {
-                                list: true,
-                                payload_length: entry_buffer.len()
-                            };
-                            entry_header.encode(&mut access_list_rlp);
-                            access_list_rlp.extend_from_slice(&entry_buffer);
-                        }
-                        
-                        let access_list_header = alloy_rlp::Header {
-                            list: true,
-                            payload_length: access_list_rlp.len()
-                        };
-                        access_list_header.encode(&mut rlp_data);
-                        rlp_data.extend_from_slice(&access_list_rlp);
-                        
-                        max_blob_fee.encode(&mut rlp_data);
-                        
-                        let mut blob_hashes_buffer = Vec::new();
-                        
-                        for hash in &tx.versioned_hashes {
-                            hash.encode(&mut blob_hashes_buffer);
-                        }
-                        
-                        let blob_header = alloy_rlp::Header {
-                            list: true,
-                            payload_length: blob_hashes_buffer.len()
-                        };
-                        blob_header.encode(&mut rlp_data);
-                        rlp_data.extend_from_slice(&blob_hashes_buffer);
-                        
-                        v.encode(&mut rlp_data);
-                        r.encode(&mut rlp_data);
-                        s.encode(&mut rlp_data);
-                        
-                        let mut final_buffer = Vec::new();
-                        alloy_rlp::Header { list: true, payload_length: rlp_data.len() }.encode(&mut final_buffer);
-                        final_buffer.extend_from_slice(&rlp_data);
-                        
-                        buffer.extend_from_slice(&final_buffer);
-                        Bytes::from(buffer)
-                    }
-                }
+                tx.encoded_signed_tx.clone()
             })
             .collect();
+            
+        let transactions_root = if tx_bytes.is_empty() {
+            B256::ZERO
+        } else {
+            let tx_wrappers: Vec<_> = tx_bytes.iter().map(|bytes| TxWrapper(bytes.clone())).collect();
+            calculate_transaction_root(&tx_wrappers)
+        };
+        
+        let receipts_root = if receipts.is_empty() {
+            B256::ZERO
+        } else {
+            calculate_receipt_root(&receipts)
+        };
+        
+        let logs_bloom = self.calculate_logs_bloom(&receipts);
+        
+        let state_root = crate::state::root::calculate_state_root(&state_diff, &self.state)
+            .unwrap_or(B256::ZERO);
+        
         let finalize_time = finalize_start.elapsed();
         
         let metrics = BlockMetrics {
@@ -429,14 +204,14 @@ impl WasiBlockBuilder {
             }),
         };
         
-        let header = self.create_header(metrics.gas_used)?;
+        let header = self.create_header(metrics.gas_used, transactions_root, receipts_root, state_root, logs_bloom)?;
         
         Ok(BlockBuilderOutput {
             header,
             transactions: tx_bytes,
             receipts,
             state_diff,
-            state_root,
+            state_root: Some(state_root),
             metrics,
             signature: None,
             chunk_info,
@@ -445,25 +220,52 @@ impl WasiBlockBuilder {
         })
     }
     
-    fn create_header(&self, gas_used: u64) -> Result<crate::interfaces::output::SerializedHeader, BlockBuilderError> {
-        Ok(crate::interfaces::output::SerializedHeader {
+    fn create_header(&self, gas_used: u64, transactions_root: B256, receipts_root: B256, state_root: B256, logs_bloom: [u8; 256]) -> Result<Header, BlockBuilderError> {
+        use alloy_consensus::constants::EMPTY_ROOT_HASH;
+        use alloy_eips::merge::BEACON_NONCE;
+        use alloy_primitives::FixedBytes;
+        
+        Ok(Header {
             parent_hash: self.block_params.parent_hash,
+            ommers_hash: EMPTY_ROOT_HASH,
+            beneficiary: self.block_params.coinbase,
+            state_root,
+            transactions_root,
+            receipts_root,
+            logs_bloom: alloy_primitives::Bloom::from_slice(&logs_bloom),
+            difficulty: U256::ZERO.into(),
             number: self.block_params.number,
+            gas_limit: self.block_params.gas_limit.into(),
+            gas_used: gas_used.into(),
             timestamp: self.block_params.timestamp,
-            coinbase: self.block_params.coinbase,
-            difficulty: U256::ZERO,
-            gas_limit: self.block_params.gas_limit,
-            gas_used,
-            base_fee_per_gas: self.block_params.base_fee_per_gas,
             extra_data: Bytes::default(),
-            state_root: B256::ZERO,
-            transactions_root: B256::ZERO,
-            receipts_root: B256::ZERO,
-            logs_bloom: [0u8; 256],
             mix_hash: B256::ZERO,
+            nonce: FixedBytes::from(BEACON_NONCE.to_be_bytes()),
+            base_fee_per_gas: Some(self.block_params.base_fee_per_gas.to::<u64>()),
             withdrawals_root: self.block_params.withdrawals_root,
-            blob_gas_used: self.block_params.blob_gas_used,
-            excess_blob_gas: self.block_params.excess_blob_gas,
+            blob_gas_used: self.block_params.blob_gas_used.map(|v| v.into()),
+            excess_blob_gas: self.block_params.excess_blob_gas.map(|v| v.into()),
+            parent_beacon_block_root: self.block_params.parent_beacon_block_root,
+            requests_hash: None,
         })
+    }
+    
+
+    fn calculate_logs_bloom(&self, receipts: &[crate::interfaces::output::SerializedReceipt]) -> [u8; 256] {
+        use alloy_primitives::{Log, LogData, Bloom};
+        
+        let logs: Vec<Log> = receipts
+            .iter()
+            .flat_map(|receipt| &receipt.logs)
+            .map(|log| {
+                Log {
+                    address: log.address,
+                    data: LogData::new_unchecked(log.topics.clone(), log.data.clone()),
+                }
+            })
+            .collect();
+            
+        let bloom = alloy_primitives::logs_bloom(logs.iter());
+        *bloom.data()
     }
 }

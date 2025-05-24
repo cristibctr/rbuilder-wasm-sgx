@@ -57,6 +57,7 @@ struct BlockParams {
     withdrawals_root: Option<B256>,
     blob_gas_used: Option<u64>,
     excess_blob_gas: Option<u64>,
+    parent_beacon_block_root: Option<B256>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +153,7 @@ struct SerializedHeader {
     withdrawals_root: Option<B256>,
     blob_gas_used: Option<u64>,
     excess_blob_gas: Option<u64>,
+    parent_beacon_block_root: Option<B256>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +353,7 @@ impl SgxWasmBacktestAdapter {
             withdrawals_root: None,
             blob_gas_used: None,
             excess_blob_gas: None,
+            parent_beacon_block_root: None,
         };
         let mut accounts = Vec::new();
         let mut storage = Vec::new();

@@ -20,6 +20,7 @@ tokio-util = { workspace = true }
 eyre.workspace = true
 thiserror.workspace = true
 sgx-wasm-runner = { path = "../sgx-wasm-runner", optional = true }
+block-builder-types = { path = "../block-builder-types" }
 k256 = { version = "0.13", features = ["ecdsa"], optional = true }
 ecdsa = { version = "0.16", optional = true }
 sha3 = { version = "0.10", optional = true }

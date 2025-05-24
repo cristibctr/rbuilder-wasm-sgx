@@ -16,6 +16,18 @@ lazy_static! {
     static ref SIMULATOR_INIT: Once = Once::new();
 }
 
+#[link(wasm_import_module = "env")]
+extern "C" {
+    fn enclave_print(message: *const u8) -> i32;
+}
+
+pub fn sgx_log(message: &str) {
+    let message = format!("{}\n\0", message);
+    unsafe {
+        enclave_print(message.as_ptr());
+    }
+}
+
 // Import the interfaces WasiError for conversion
 use interfaces::WasiError as InterfacesWasiError;
 use crate::interfaces::serialize_output_without_signature;
@@ -75,7 +87,10 @@ pub extern "C" fn build_block(
     match process_build_block_safe(input_ptr, input_len, output_ptr, output_len_ptr) {
         Ok(_) => 0,
         Err(e) => {
-            log::error!("build_block failed: {}", e);
+            let error_msg = format!("build_block failed: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
+            
             match e {
                 WasiError::NullInputPtr => -1,
                 WasiError::NullOutputPtr => -1,
@@ -126,7 +141,9 @@ fn process_build_block_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
     let input_data = deserialize_block_input(input)
         .map_err(|e| WasiError::InputDeserialization(format!("Failed to deserialize BlockBuilderInput: {}", e)))?;
     
-    log::info!("Starting block build for block {}", input_data.block_params.number);
+    let log_message = format!("Starting block build for block {}", input_data.block_params.number);
+    log::info!("{}", log_message);
+    sgx_log(&log_message);
     
     let state_provider = WasiStateProvider::new(
         input_data.accounts,
@@ -148,13 +165,19 @@ fn process_build_block_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
 
         if let Ok(mut guard) = LAST_SIMULATOR.lock() {
             *guard = Some(simulator_ref.clone());
-            log::info!("Stored simulator instance for build ID: {}", output_data.build_id.as_ref().unwrap());
+            let log_message = format!("Stored simulator instance for build ID: {}", output_data.build_id.as_ref().unwrap());
+            log::info!("{}", log_message);
+            sgx_log(&log_message);
         } else {
-            log::warn!("Failed to store simulator instance for chunk retrieval");
+            let warning = "Failed to store simulator instance for chunk retrieval";
+            log::warn!("{}", warning);
+            sgx_log(&warning);
         }
     }
 
-    log::info!("Signing block {}", output_data.header.number);
+    let sign_message = format!("Signing block {}", output_data.header.number);
+    log::info!("{}", sign_message);
+    sgx_log(&sign_message);
 
     let signer = crypto::BlockSigner::new()?;
 
@@ -164,7 +187,9 @@ fn process_build_block_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
 
     output_data.signature = Some(signature);
         
-    log::info!("Finished block build for block {} with signature", output_data.header.number);
+    let finish_message = format!("Finished block build for block {} with signature", output_data.header.number);
+    log::info!("{}", finish_message);
+    sgx_log(&finish_message);
 
     serialize_output(&output_data)
         .map_err(|e| WasiError::OutputSerialization(format!("Failed to serialize BlockBuilderOutput: {}", e)))
@@ -181,7 +206,10 @@ pub extern "C" fn estimate_gas(
      match process_estimate_gas_safe(tx_data_ptr, tx_data_len, state_data_ptr, state_data_len, result_ptr) {
         Ok(_) => 0,
         Err(e) => {
-            log::error!("estimate_gas failed: {}", e);
+            let error_msg = format!("estimate_gas failed: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
+            
             match e {
                 WasiError::NullInputPtr => -1,
                 WasiError::NullOutputPtr => -1,
@@ -251,7 +279,10 @@ pub extern "C" fn get_module_info(
     let public_key = match crypto::export_public_key_hex() {
         Ok(key) => Some(key),
         Err(e) => {
-            log::warn!("Failed to get public key: {}", e);
+            let error_msg = format!("Failed to get public key: {}", e);
+            log::warn!("{}", error_msg);
+            sgx_log(&error_msg);
+
             None
         }
     };
@@ -346,7 +377,9 @@ pub extern "C" fn get_state_diff_chunk(
     match process_get_state_diff_chunk_safe(chunk_id, build_id_ptr, build_id_len, output_ptr, output_len_ptr) {
         Ok(_) => 0,
         Err(e) => {
-            log::error!("get_state_diff_chunk failed: {}", e);
+            let error_msg = format!("get_state_diff_chunk failed: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
             match e {
                 WasiError::NullInputPtr => -1,
                 WasiError::NullOutputPtr => -1,
@@ -411,12 +444,18 @@ fn process_estimate_gas_internal(tx_data: &[u8], state_data: &[u8]) -> WasiResul
     let tx = serde_json::from_slice(tx_data)
         .map_err(|e| WasiError::InputDeserialization(format!("Failed to deserialize transaction: {}", e)))?;
     
-    log::debug!("Transaction parsed successfully: {:?}", tx);
+    let error_msg = format!("Transaction parsed successfully: {:?}", tx);
+    log::debug!("{}", error_msg);
+    sgx_log(&error_msg);
+
     
     let state_input = deserialize_state_input(state_data)
         .map_err(|e| WasiError::InputDeserialization(format!("Failed to deserialize state input: {}", e)))?;
     
-    log::debug!("State input parsed successfully with {} accounts", state_input.accounts.len());
+    let error_msg = format!("State input parsed successfully with {} accounts", state_input.accounts.len());
+    log::debug!("{}", error_msg);
+    sgx_log(&error_msg);
+
     
     let state_provider = WasiStateProvider::new(
         state_input.accounts,
@@ -440,7 +479,9 @@ pub extern "C" fn calculate_state_root(
      match process_calculate_state_root_safe(changes_ptr, changes_len, state_ptr, state_len, result_ptr, result_len_ptr) {
         Ok(_) => 0,
         Err(e) => {
-            log::error!("calculate_state_root failed: {}", e);
+            let error_msg = format!("calculate_state_root failed: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
             match e {
                 WasiError::NullInputPtr => -1,
                 WasiError::NullOutputPtr => -1,
@@ -465,7 +506,10 @@ pub extern "C" fn set_log_level(level: i32) -> i32 {
 pub extern "C" fn wbm_alloc(size: usize) -> *mut u8 {
     
     if size > 100 * 1024 * 1024 {
-        log::warn!("Allocation request of {} bytes exceeds 100MB limit, refusing", size);
+        let error_msg = format!("Allocation request of {} bytes exceeds 100MB limit, refusing", size);
+        log::warn!("{}", error_msg);
+        sgx_log(&error_msg);
+
         return std::ptr::null_mut();
     }
     
@@ -476,7 +520,9 @@ pub extern "C" fn wbm_alloc(size: usize) -> *mut u8 {
     let layout = match std::alloc::Layout::from_size_align(size, 8) {
         Ok(layout) => layout,
         Err(e) => {
-            log::error!("Invalid layout parameters for allocation: {}", e);
+            let error_msg = format!("Invalid layout parameters for allocation: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
             return std::ptr::null_mut();
         }
     };
@@ -484,10 +530,15 @@ pub extern "C" fn wbm_alloc(size: usize) -> *mut u8 {
     let ptr = unsafe { std::alloc::alloc(layout) };
     
     if ptr.is_null() {
-        log::error!("Memory allocation of {} bytes failed", size);
+        let error_msg = format!("Memory allocation of {} bytes failed", size);
+        log::error!("{}", error_msg);
+        sgx_log(&error_msg);
         std::ptr::null_mut()
     } else {
-        log::debug!("Successfully allocated {} bytes at {:p}", size, ptr);
+        let error_msg = format!("Successfully allocated {} bytes at {:p}", size, ptr);
+        log::debug!("{}", error_msg);
+        sgx_log(&error_msg);
+
         ptr
     }
 }
@@ -495,29 +546,43 @@ pub extern "C" fn wbm_alloc(size: usize) -> *mut u8 {
 #[no_mangle]
 pub extern "C" fn wbm_free(ptr: *mut u8, size: usize) {
     if ptr.is_null() {
-        log::debug!("Attempted to free null pointer, ignoring");
+        let error_msg = format!("Attempted to free null pointer, ignoring");
+        log::debug!("{}", error_msg);
+        sgx_log(&error_msg);
+
         return;
     }
     
     if size == 0 {
-        log::debug!("Attempted to free zero-sized allocation, ignoring");
+        let error_msg = format!("Attempted to free zero-sized allocation, ignoring");
+        log::debug!("{}", error_msg);
+        sgx_log(&error_msg);
+
         return;
     }
     
     if size > 100 * 1024 * 1024 {
-        log::warn!("Attempted to free suspiciously large allocation of {} bytes, refusing", size);
+        let error_msg = format!("Attempted to free suspiciously large allocation of {} bytes, refusing", size);
+        log::warn!("{}", error_msg);
+        sgx_log(&error_msg);
+
         return;
     }
     
     let layout = match std::alloc::Layout::from_size_align(size, 8) {
         Ok(layout) => layout,
         Err(e) => {
-            log::error!("Invalid layout parameters for deallocation: {}", e);
+            let error_msg = format!("Invalid layout parameters for deallocation: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
             return;
         }
     };
     
-    log::debug!("Freeing {} bytes at {:p}", size, ptr);
+    let error_msg = format!("Freeing {} bytes at {:p}", size, ptr);
+    log::debug!("{}", error_msg);
+    sgx_log(&error_msg);
+
     unsafe {
         std::alloc::dealloc(ptr, layout);
     }

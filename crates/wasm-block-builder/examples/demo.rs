@@ -724,7 +724,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "blob_hashes": [],
                 "max_priority_fee_per_gas": null,
                 "max_fee_per_blob_gas": null,
-                "versioned_hashes": []
+                "versioned_hashes": [],
+                "encoded_signed_tx": "0xf86b058503b9aca00825208942222222222222222222222222222222222222228801bc16d674ec800080819aa01234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdefa01234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
             }
         ],
         "bundles": [],

@@ -47,6 +47,8 @@ pub struct BlockParams {
     pub blob_gas_used: Option<u64>,
     
     pub excess_blob_gas: Option<u64>,
+    
+    pub parent_beacon_block_root: Option<B256>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +107,8 @@ pub struct SerializedTransaction {
     pub max_fee_per_blob_gas: Option<U256>,
     
     pub versioned_hashes: Vec<B256>,
+    
+    pub encoded_signed_tx: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

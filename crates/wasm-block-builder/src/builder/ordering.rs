@@ -54,6 +54,7 @@ impl WasiOrderSorter {
             withdrawals_root: None,
             blob_gas_used: None,
             excess_blob_gas: None,
+            parent_beacon_block_root: None,
         };
         
         Self { 

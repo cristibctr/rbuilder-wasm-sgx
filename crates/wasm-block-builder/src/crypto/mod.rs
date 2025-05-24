@@ -5,6 +5,7 @@ use sha3::{Digest, Keccak256};
 use thiserror::Error;
 use std::sync::{Mutex, OnceLock};
 use rand_core::OsRng;
+use crate::sgx_log;
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -58,7 +59,10 @@ impl BlockSigner {
             return Ok(key.clone());
         }
 
-        log::info!("Generating new ECDSA key pair for block signing");
+        let error_msg = format!("Generating new ECDSA key pair for block signing");
+        log::info!("{}", error_msg);
+        sgx_log(&error_msg);
+
         let private_key = Self::generate_new_key()?;
 
         key_store.private_key = Some(private_key.clone());
@@ -71,7 +75,10 @@ impl BlockSigner {
     pub(crate) fn generate_new_key() -> Result<SigningKey> {
         #[cfg(feature = "test-key")]
         {
-            log::warn!("Using test key");
+            let error_msg = format!("Using test key");
+            log::warn!("{}", error_msg);
+            sgx_log(&error_msg);
+
             let private_key_hex = "0000000000000000000000000000000000000000000000000000000000000001";
             let key_bytes = hex::decode(private_key_hex)
                 .map_err(|e| CryptoError::KeyError(format!("Failed to decode test key: {}", e)))?;
@@ -120,7 +127,10 @@ pub fn get_current_public_key() -> Result<VerifyingKey> {
     if let Some(ref private_key) = key_store.private_key {
         Ok(*private_key.verifying_key())
     } else {
-        log::info!("Key not initialized. Generating new ECDSA key pair for the enclave");
+        let error_msg = format!("Key not initialized. Generating new ECDSA key pair for the enclave");
+        log::info!("{}", error_msg);
+        sgx_log(&error_msg);
+
         let private_key = BlockSigner::generate_new_key()?;
         key_store.private_key = Some(private_key.clone());
 

@@ -3,6 +3,7 @@ use k256::ecdsa::{signature::Verifier, VerifyingKey, Signature};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
+use block_builder_types::BlockBuilderOutput;
 
 use std::fmt::Display;
 
@@ -31,26 +32,6 @@ pub struct BlockSignatureVerifier {
     public_key: VerifyingKey,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BlockBuilderOutput {
-    pub header: serde_json::Value,
-    pub transactions: serde_json::Value,
-    pub receipts: serde_json::Value, 
-    pub state_diff: serde_json::Value,
-    pub state_root: serde_json::Value,
-    pub metrics: serde_json::Value,
-    
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub build_id: Option<serde_json::Value>,
-    
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chunk_info: Option<serde_json::Value>,
-    
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_requests: Option<serde_json::Value>,
-    
-    pub signature: Option<Bytes>,
-}
 
 impl BlockSignatureVerifier {
     pub fn new(public_key_hex: &str) -> Result<Self> {
@@ -64,27 +45,13 @@ impl BlockSignatureVerifier {
     pub fn verify(&self, output_json: &str) -> Result<bool> {
         tracing::debug!("Starting signature verification with output JSON");
         
-        let mut json_value: serde_json::Value = serde_json::from_str(output_json)?;
+        let mut output: BlockBuilderOutput = serde_json::from_str(output_json)?;
         
-        tracing::debug!("Extracting signature from JSON value");
-        let signature = match json_value.get("signature") {
-            Some(sig_value) => {
-                let sig_str = sig_value.as_str().ok_or_else(|| {
-                    SignatureVerificationError::InvalidSignatureFormat("Signature is not a string".to_string())
-                })?;
-                
-                let sig_hex = if sig_str.starts_with("0x") {
-                    &sig_str[2..]
-                } else {
-                    sig_str
-                };
-                
-                let sig_bytes = hex::decode(sig_hex).map_err(|e| {
-                    SignatureVerificationError::InvalidSignatureFormat(format!("Invalid hex in signature: {}", e))
-                })?;
-                
+        tracing::debug!("Extracting signature from parsed output");
+        let signature = match output.signature.take() {
+            Some(sig_bytes) => {
                 tracing::debug!("Signature found: 0x{}", hex::encode(&sig_bytes));
-                Bytes::from(sig_bytes)
+                sig_bytes
             },
             None => {
                 tracing::warn!("No signature field found in output JSON");
@@ -92,18 +59,14 @@ impl BlockSignatureVerifier {
             }
         };
         
-        if let Some(obj) = json_value.as_object_mut() {
-            obj.remove("signature");
-        }
-        
-        tracing::debug!("Re-serializing data with signature removed (sorted)");
-        let data_to_verify = serde_json::to_string(&json_value)?;
+        tracing::debug!("Re-serializing data with signature removed");
+        let data_to_verify = serde_json::to_vec(&output)?;
         tracing::debug!("Serialized data size: {} bytes", data_to_verify.len());
-        tracing::debug!("Serialized data: {}", &data_to_verify.chars().collect::<String>());
+        tracing::debug!("Serialized data: {}", String::from_utf8_lossy(&data_to_verify));
         
         tracing::debug!("Hashing data with Keccak256");
         let mut hasher = Keccak256::new();
-        hasher.update(data_to_verify.as_bytes());
+        hasher.update(&data_to_verify);
         let hash = hasher.finalize();
         tracing::debug!("Data hash: 0x{}", hex::encode(&hash));
         
@@ -181,27 +144,13 @@ impl EnclaveKeyRegistry {
             return Err(SignatureVerificationError::VerificationFailed);
         }
         
-        let mut json_value: serde_json::Value = serde_json::from_str(output_json)?;
+        let mut output: BlockBuilderOutput = serde_json::from_str(output_json)?;
         
-        tracing::debug!("Extracting signature from JSON value");
-        let signature = match json_value.get("signature") {
-            Some(sig_value) => {
-                let sig_str = sig_value.as_str().ok_or_else(|| {
-                    SignatureVerificationError::InvalidSignatureFormat("Signature is not a string".to_string())
-                })?;
-                
-                let sig_hex = if sig_str.starts_with("0x") {
-                    &sig_str[2..]
-                } else {
-                    sig_str
-                };
-                
-                let sig_bytes = hex::decode(sig_hex).map_err(|e| {
-                    SignatureVerificationError::InvalidSignatureFormat(format!("Invalid hex in signature: {}", e))
-                })?;
-                
+        tracing::debug!("Extracting signature from parsed output");
+        let signature = match output.signature.take() {
+            Some(sig_bytes) => {
                 tracing::debug!("Signature found: 0x{}", hex::encode(&sig_bytes));
-                Bytes::from(sig_bytes)
+                sig_bytes
             },
             None => {
                 tracing::warn!("No signature field found in output JSON");
@@ -209,16 +158,12 @@ impl EnclaveKeyRegistry {
             }
         };
         
-        if let Some(obj) = json_value.as_object_mut() {
-            obj.remove("signature");
-        }
-        
         tracing::debug!("Re-serializing data with signature removed");
-        let data_to_verify = json_value.to_string();
+        let data_to_verify = serde_json::to_vec(&output)?;
         
         tracing::debug!("Hashing data with Keccak256");
         let mut hasher = Keccak256::new();
-        hasher.update(data_to_verify.as_bytes());
+        hasher.update(&data_to_verify);
         let hash = hasher.finalize();
         
         let sig = Signature::try_from(signature.as_ref())

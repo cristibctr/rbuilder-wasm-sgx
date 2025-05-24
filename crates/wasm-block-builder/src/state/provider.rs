@@ -1,5 +1,5 @@
 use crate::interfaces::input::{SerializedAccount, SerializedCode, SerializedStorage};
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, Bytes};
 use hashbrown::HashMap;
 use std::collections::hash_map::RandomState as StdRandomState;
 use revm::{
@@ -7,6 +7,7 @@ use revm::{
     Database, DatabaseCommit,
 };
 use thiserror::Error;
+use std::str::FromStr;
 
 #[derive(Error, Debug, PartialEq, Eq)]
 pub enum StateError {
@@ -36,6 +37,8 @@ pub struct WasiStateProvider {
 }
 
 use alloy_rlp;
+use revm::primitives::KECCAK_EMPTY;
+use crate::sgx_log;
 use super::diff::MerkleProof;
 
 impl WasiStateProvider {
@@ -44,6 +47,11 @@ impl WasiStateProvider {
         storage: Vec<SerializedStorage>,
         code: Vec<SerializedCode>,
     ) -> Self {
+        let error_msg = format!("Initializing WasiStateProvider with {} accounts, {} storage entries, {} code entries",
+                                accounts.len(), storage.len(), code.len());
+        log::debug!("{}", error_msg);
+        sgx_log(&error_msg);
+        
         let accounts_map = accounts
             .into_iter()
             .map(|account| {
@@ -53,29 +61,50 @@ impl WasiStateProvider {
                     code_hash: account.code_hash,
                     code: None,
                 };
+                let error_msg = format!("Added account: address={:?}, balance={:?}, nonce={}, code_hash={:?}",
+                                        account.address, account_info.balance, account_info.nonce, account_info.code_hash);
+                log::debug!("{}", error_msg);
+                sgx_log(&error_msg);
                 (account.address, account_info)
             })
             .collect();
             
         let storage_map = storage
             .into_iter()
-            .map(|storage| ((storage.address, storage.slot), storage.value))
+            .map(|storage| {
+                let error_msg = format!("Added storage: address={:?}, slot={:?}, value={:?}",
+                                        storage.address, storage.slot, storage.value);
+                log::debug!("{}", error_msg);
+                sgx_log(&error_msg);
+                ((storage.address, storage.slot), storage.value)
+            })
             .collect();
             
         let code_map = code
             .into_iter()
             .map(|code| {
                 let bytecode = Bytecode::new_raw(code.bytecode);
+                let error_msg = format!("Added code: hash={:?}, bytecode_len={}",
+                                        code.hash, bytecode.bytecode().len());
+                log::debug!("{}", error_msg);
+                sgx_log(&error_msg);
+
                 (code.hash, bytecode)
             })
             .collect();
             
-        Self {
+        let provider = Self {
             accounts: accounts_map,
             storage: storage_map,
             code: code_map,
             block_hashes: HashMap::with_hasher(StdRandomState::new()),
-        }
+        };
+        
+        let error_msg = format!("WasiStateProvider initialized successfully");
+        log::debug!("{}", error_msg);
+        sgx_log(&error_msg);
+
+        provider
     }
     
     pub fn account_info(&self, address: Address) -> Option<AccountInfo> {
@@ -115,7 +144,7 @@ impl WasiStateProvider {
                 .collect();
                 
             if slots.is_empty() {
-                Some(alloy_primitives::constants::KECCAK_EMPTY)
+                Some(KECCAK_EMPTY)
             } else {
                 let mut sorted_slots = slots.clone();
                 sorted_slots.sort_by(|a, b| a.0.cmp(&b.0));
@@ -144,7 +173,7 @@ impl WasiStateProvider {
         let account_info = self.accounts.get(address)?;
         
         let storage_root = self.get_storage_root(address).unwrap_or_else(|| {
-            B256::from_hex("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").unwrap_or_default()
+            B256::from_str("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421").unwrap_or_default()
         });
         
         let account_value = serde_json::to_vec(&serde_json::json!({
@@ -248,6 +277,10 @@ impl Database for WasiStateProvider {
     }
     
     fn code_by_hash(&mut self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        if code_hash == KECCAK_EMPTY || code_hash == B256::ZERO {
+            return Ok(Bytecode::new());
+        }
+        
         self.code
             .get(&code_hash)
             .cloned()

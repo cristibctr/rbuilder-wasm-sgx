@@ -4,6 +4,7 @@ mod tracer;
 use crate::interfaces::input::{BlockParams, SerializedTransaction, TxType};
 use crate::state::provider::{StateError, WasiStateProvider};
 use alloy_primitives::{Address, B256, Bytes, U256};
+use log::{debug, error, info, warn};
 use revm::{
     primitives::{
         AccessList, CreateScheme, ResultAndState as RevmResultAndState,
@@ -60,6 +61,8 @@ fn configure_evm<'a>(
     state: &'a mut WasiStateProvider, 
     block_params: &'a BlockParams,
 ) -> revm::Evm<'a, (), &'a mut WasiStateProvider> {
+    debug!("Configure EVM with parent_state_root: {:?}", block_params.parent_state_root);
+    
     let mut evm = revm::Evm::builder()
         .with_db(state)
         .build();
@@ -70,10 +73,16 @@ fn configure_evm<'a>(
     block_env.coinbase = Address::from_slice(block_params.coinbase.as_slice());
     block_env.gas_limit = U256::from(block_params.gas_limit);
     block_env.basefee = block_params.base_fee_per_gas;
+    block_env.prevrandao = Some(block_params.parent_hash);
     
     *evm.block_mut() = block_env;
     
     evm.cfg_mut().chain_id = 1;
+    
+    evm.cfg_mut().limit_contract_code_size = Some(0x100000);
+    
+    debug!("EVM configured with: number={}, timestamp={}, gas_limit={}, basefee={:?}", 
+           block_params.number, block_params.timestamp, block_params.gas_limit, block_params.base_fee_per_gas);
     
     evm
 }
@@ -156,6 +165,7 @@ pub fn estimate_gas(
         withdrawals_root: None,
         blob_gas_used: None,
         excess_blob_gas: None,
+        parent_beacon_block_root: None,
     };
     
     let mut evm = configure_evm(&mut state_copy, &block_params);
@@ -241,6 +251,9 @@ pub fn execute_transaction_with_trace(
 ) -> Result<ResultAndState, EVMError> {
     let mut inspector = WasiEVMInspector::new(state_trace);
     
+    debug!("Executing transaction with trace: hash={:?}, from={:?}, to={:?}, nonce={}, value={:?}", 
+           tx.hash, tx.from, tx.to, tx.nonce, tx.value);
+    
     inspector.track_tx_nonce(tx.from, tx.nonce);
     
     let mut state_clone = state.clone();
@@ -257,7 +270,11 @@ pub fn execute_transaction_with_trace(
         .with_env(Box::new(*evm.context.evm.env.clone()))
         .build();
     
-    let result = evm_with_inspector.transact_commit().map_err(|e| EVMError::from(e))?;
+    let result = evm_with_inspector.transact_commit().map_err(|e| {
+        debug!("Transaction execution error: {:?}, hash={:?}, from={:?}, to={:?}", 
+               e, tx.hash, tx.from, tx.to);
+        EVMError::from(e)
+    })?;
     
     if let ExecutionResult::Success { gas_used, output, .. } = result {
         let blob_gas_used = match tx.tx_type {
@@ -280,6 +297,9 @@ pub fn execute_transaction_with_trace(
         
         let coinbase_profit = gas_price * U256::from(gas_used);
         
+        debug!("Transaction executed successfully: hash={:?}, gas_used={}, value={:?}, profit={:?}", 
+               tx.hash, gas_used, tx.value, coinbase_profit);
+        
         Ok(ResultAndState {
             gas_used,
             blob_gas_used,
@@ -288,6 +308,19 @@ pub fn execute_transaction_with_trace(
             coinbase_profit,
         })
     } else {
-        Err(EVMError::Execution(format!("Transaction execution failed: {:?}", result)))
+        let error_msg = match &result {
+            ExecutionResult::Revert { gas_used, output } => {
+                format!("Transaction reverted with output: {:?}, gas_used: {}", output, gas_used)
+            },
+            ExecutionResult::Halt { reason, gas_used } => {
+                format!("Transaction halted: {:?}, gas_used: {}", reason, gas_used)
+            },
+            _ => format!("Transaction execution failed: {:?}", result)
+        };
+        
+        debug!("Transaction execution failed: hash={:?}, from={:?}, to={:?}, value={:?}, gas_limit={}, error={}", 
+               tx.hash, tx.from, tx.to, tx.value, tx.gas_limit, error_msg);
+        
+        Err(EVMError::Execution(error_msg))
     }
 }

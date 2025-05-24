@@ -47,7 +47,7 @@ impl Playground {
     pub fn new(name: &str, cfg_path: &PathBuf) -> Result<Self, PlaygroundError> {
         // load the binary from the cargo_dir
         let mut bin_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        bin_path.push("../../target/debug/rbuilder");
+        bin_path.push("../../target/release/rbuilder");
 
         let dt: OffsetDateTime = SystemTime::now().into();
 

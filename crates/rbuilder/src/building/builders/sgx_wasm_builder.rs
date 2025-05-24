@@ -5,12 +5,13 @@ use std::collections::HashMap;
 
 use alloy_primitives::{Address, Bytes, StorageValue, B256, U256 as AlloyU256, keccak256, FixedBytes};
 use alloy_rlp::{Encodable as AlloyEncodable, Decodable as AlloyDecodable, RlpEncodable, RlpDecodable};
+use alloy_eips::eip2718::Encodable2718;
 use eyre::{eyre, Result, Report as ErrReport};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error, debug, trace};
 use tokio::sync::oneshot;
 use std::hash::Hash;
-use alloy_consensus::{Transaction, TxType, EMPTY_ROOT_HASH};
+use alloy_consensus::{Transaction, TxType, EMPTY_ROOT_HASH, Header as AlloyHeader};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_eips::eip4895::Withdrawal;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, PayloadBuilderAttributes};
@@ -62,7 +63,7 @@ use crate::utils::NonceCache;
 use crate::primitives::SimValue;
 use std::sync::Arc;
 use std::cmp::Ordering;
-use alloy_consensus::constants::KECCAK_EMPTY;
+use alloy_consensus::constants::{EMPTY_WITHDRAWALS, KECCAK_EMPTY};
 
 #[derive(Debug, Clone)]
 pub struct ValidOrderPriority {
@@ -138,7 +139,7 @@ struct SgxWasmBlockBuildingHelper {
     receipts: Vec<RethReceipt>,
     blob_sidecars: Vec<Arc<alloy_eips::eip4844::BlobTransactionSidecar>>,
     execution_requests: Vec<alloy_primitives::Bytes>,
-    sgx_output_header: SerializedHeader,
+    sgx_output_header: AlloyHeader,
     sgx_state_diff: SerializedStateDiff,
 }
 
@@ -151,13 +152,14 @@ impl SgxWasmBlockBuildingHelper {
         receipts: Vec<RethReceipt>,
         blob_sidecars: Vec<Arc<alloy_eips::eip4844::BlobTransactionSidecar>>,
         execution_requests: Vec<alloy_primitives::Bytes>,
-        sgx_output_header: SerializedHeader,
+        sgx_output_header: AlloyHeader,
         sgx_state_diff: SerializedStateDiff,
+        block_trace: BuiltBlockTrace,
     ) -> Self {
         Self {
             block_value,
             builder_name,
-            block_trace: BuiltBlockTrace::new(),
+            block_trace,
             block_context,
             cached_reads: reth::revm::cached::CachedReads::default(),
             coinbase_profit: block_value,
@@ -229,156 +231,48 @@ impl block_building_helper::BlockBuildingHelper for SgxWasmBlockBuildingHelper {
         self.block_trace.update_orders_sealed_at();
         
         let ctx = &self.block_context;
-        
-        let gas_used = self.receipts.iter().map(|r| r.cumulative_gas_used).sum::<u64>();
-        
-        let blob_gas_used = if ctx.chain_spec.is_cancun_active_at_timestamp(ctx.attributes.timestamp) {
-            let blob_count = self.blob_sidecars.len();
-            if blob_count > 0 {
-                let blob_gas_per_blob = 131072;
-                Some(blob_count as u64 * blob_gas_per_blob)
-            } else {
-                Some(0)
-            }
-        } else {
-            None
-        };
-        
-        let logs_bloom = if !self.receipts.is_empty() {
-            Bloom::from_slice(&self.sgx_output_header.logs_bloom)
-        } else {
-            Bloom::default()
-        };
-        
-        let withdrawals_root = if ctx.chain_spec.is_shanghai_active_at_timestamp(ctx.attributes.timestamp) {
-            let withdrawals: &[Withdrawal] = &[];
-            Some(proofs::calculate_withdrawals_root(withdrawals))
-        } else {
-            None
-        };
-        
-        let transactions_for_root: Vec<TransactionSigned> = self.executed_txs.iter()
-            .map(|tx| tx.internal_tx_unsecure().tx().clone())
-            .collect();
-        let transactions_root = proofs::calculate_transaction_root(&transactions_for_root);
-        
-        let receipts_root = {
-            if self.receipts.is_empty() {
-                EMPTY_ROOT_HASH
-            } else {
-                self.sgx_output_header.receipts_root
-            }
-        };
-        
-        let root_hasher_start = Instant::now();
-        let state_root = {
-            let mut state_trie = DiffTrie::new_empty();
-            let mut account_storage_tries: HashMap<Address, DiffTrie> = HashMap::new();
 
-            let mut storage_diff_by_account: HashMap<Address, Vec<&SerializedStorageDiff>> = HashMap::new();
-            for storage_item in &self.sgx_state_diff.storage {
-                storage_diff_by_account.entry(storage_item.address).or_default().push(storage_item);
-            }
-
-            for acc_diff in &self.sgx_state_diff.accounts {
-                let address = acc_diff.address;
-                let hashed_address = keccak256(address.as_slice());
-
-                let storage_root = if let Some(storage_diffs) = storage_diff_by_account.get(&address) {
-                    let storage_trie = account_storage_tries.entry(address).or_insert_with(DiffTrie::new_empty);
-                    for s_diff in storage_diffs {
-                        let slot_hash = keccak256(s_diff.slot.as_slice());
-                        let nibbles = Nibbles::unpack(&slot_hash);
-                        
-                        let mut rlp_value = Vec::new();
-                        AlloyEncodable::encode(&AlloyU256::from_be_bytes(s_diff.new_value.0), &mut rlp_value);
-
-                        storage_trie.insert(nibbles.to_vec().into(), rlp_value.into())
-                            .map_err(|e| BlockBuildingHelperError::from(eyre!("Failed to insert into storage trie: {:?}", e)))?;
-                    }
-                    storage_trie.root_hash().map_err(|e| BlockBuildingHelperError::from(eyre!("Failed to compute storage trie hash: {:?}", e)))?
-                } else {
-                    acc_diff.old_code_hash.and_then(|och| if och == EMPTY_CODE_HASH { Some(EMPTY_TRIE_ROOT) } else { None} )
-                        .unwrap_or(KECCAK_EMPTY_TRIE_HASH)
-                };
-
-                let nonce = acc_diff.new_nonce.unwrap_or_default();
-                let balance = acc_diff.new_balance.unwrap_or_default();
-                let code_hash = acc_diff.new_code_hash.or(acc_diff.old_code_hash).filter(|&h| h != KECCAK_EMPTY)
-                    .unwrap_or(KECCAK_EMPTY);
-                
-                let mut rlp_account_data: Vec<u8> = Vec::new();
-                
-                alloy_rlp::Encodable::encode(&nonce, &mut rlp_account_data);
-                alloy_rlp::Encodable::encode(&balance, &mut rlp_account_data);
-                alloy_rlp::Encodable::encode(&storage_root, &mut rlp_account_data);
-                alloy_rlp::Encodable::encode(&code_hash, &mut rlp_account_data);
-                
-                let nibbles = Nibbles::unpack(&hashed_address);
-                state_trie.insert(nibbles.to_vec().into(), rlp_account_data.into())
-                    .map_err(|e| BlockBuildingHelperError::from(eyre!("Failed to insert into state trie: {:?}", e)))?;
-            }
-             state_trie.root_hash().map_err(|e| BlockBuildingHelperError::from(eyre!("Failed to compute state trie hash: {:?}", e)))?
-        };
+        let header = self.sgx_output_header.clone();
         
-        let root_hash_time = root_hasher_start.elapsed();
-        self.block_trace.root_hash_time = root_hash_time;
-
-        
-        let block_number = ctx.evm_env.block_env.number.to::<u64>();
-        
-        let header = RethHeader {
-            parent_hash: ctx.attributes.parent,
-            ommers_hash: EMPTY_ROOT_HASH,
-            beneficiary: ctx.evm_env.block_env.coinbase,
-            state_root,
-            transactions_root,
-            receipts_root,
-            logs_bloom,
-            difficulty: AlloyU256::ZERO.into(),
-            number: block_number,
-            gas_limit: ctx.evm_env.block_env.gas_limit.to::<u64>(),
-            gas_used,
-            timestamp: ctx.attributes.timestamp,
-            extra_data: ctx.extra_data.clone().into(),
-            mix_hash: ctx.attributes.prev_randao,
-            nonce: FixedBytes::<8>::from(BEACON_NONCE),
-            base_fee_per_gas: Some(ctx.evm_env.block_env.basefee.to()),
-            withdrawals_root,
-            blob_gas_used,
-            excess_blob_gas: ctx.excess_blob_gas.map(|val| val.into()),
-            parent_beacon_block_root: ctx.attributes.parent_beacon_block_root,
-            requests_hash: None,
-        };
+        self.block_trace.root_hash_time = Duration::from_millis(0);
         
         let reth_transactions: Vec<TransactionSigned> = self.executed_txs.iter()
             .map(|tx| tx.internal_tx_unsecure().tx().clone())
             .collect();
 
+        let withdrawals = if ctx.chain_spec.is_shanghai_active_at_timestamp(ctx.attributes.timestamp) {
+            Some(ctx.attributes.withdrawals.clone())
+        } else {
+            None
+        };
+        
         let body = reth::primitives::BlockBody {
             transactions: reth_transactions,
             ommers: vec![],
-            withdrawals: None,
+            withdrawals,
         };
         
         let block_with_senders = reth::primitives::Block { header: header.clone(), body };
         
+        let sealed_block = reth::primitives::SealedBlock::seal_slow(block_with_senders);
+        
         self.block_trace.finalize_time = start_time.elapsed();
         
         info!(
-            "SGX Block finalized: block={}, gas_used={}, tx_count={}, blob_count={}, value={}, finalize_time={:?}",
-            block_number,
-            gas_used,
+            "SGX Block finalized with SGX-computed header: block={}, gas_used={}, tx_count={}, blob_count={}, value={}, finalize_time={:?}, block_hash={:?}",
+            self.sgx_output_header.number,
+            self.sgx_output_header.gas_used,
             self.executed_txs.len(),
             self.blob_sidecars.len(),
             self.block_value,
-            self.block_trace.finalize_time
+            self.block_trace.finalize_time,
+            sealed_block.hash()
         );
         
         Ok(FinalizeBlockResult {
             block: crate::building::builders::Block {
                 trace: self.block_trace.clone(),
-                sealed_block: block_with_senders.into(),
+                sealed_block,
                 txs_blobs_sidecars: self.blob_sidecars.clone(),
                 execution_requests: self.execution_requests.clone(),
                 builder_name: self.builder_name.clone(),
@@ -457,6 +351,7 @@ struct BlockParams {
     withdrawals_root: Option<B256>,
     blob_gas_used: Option<u64>,
     excess_blob_gas: Option<u64>,
+    parent_beacon_block_root: Option<B256>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,6 +392,7 @@ struct SerializedTransaction {
     max_fee_per_gas: Option<alloy_primitives::U256>,
     max_fee_per_blob_gas: Option<alloy_primitives::U256>,
     versioned_hashes: Vec<B256>,
+    encoded_signed_tx: alloy_primitives::Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -523,7 +419,7 @@ struct BlockBuilderConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct BlockBuilderOutput {
-    header: SerializedHeader,
+    header: AlloyHeader,
     transactions: Vec<alloy_primitives::Bytes>,
     receipts: Vec<SerializedReceipt>,
     state_diff: SerializedStateDiff,
@@ -532,27 +428,6 @@ struct BlockBuilderOutput {
     signature: Option<alloy_primitives::Bytes>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedHeader {
-    parent_hash: B256,
-    number: u64,
-    timestamp: u64,
-    coinbase: Address,
-    difficulty: alloy_primitives::U256,
-    gas_limit: u64,
-    gas_used: u64,
-    base_fee_per_gas: alloy_primitives::U256,
-    extra_data: alloy_primitives::Bytes,
-    state_root: B256,
-    transactions_root: B256,
-    receipts_root: B256,
-    #[serde(with = "serde_bytes_array")]
-    logs_bloom: [u8; 256],
-    mix_hash: B256,
-    withdrawals_root: Option<B256>,
-    blob_gas_used: Option<u64>,
-    excess_blob_gas: Option<u64>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SerializedReceipt {
@@ -699,8 +574,8 @@ mod serde_bytes_array {
                     match seq.next_element()? {
                         Some(v) => result[i] = v,
                         None => return Err(Error::custom(format!(
-                            "expected {} bytes, got {}",
-                            N, i
+                "expected {} bytes, got {}",
+                N, i
                         ))),
                     }
                 }
@@ -870,7 +745,7 @@ impl SgxWasmBlockBuildingAlgorithm {
                 if let Some(code_hash) = account.bytecode_hash {
                     if code_hash != B256::ZERO {
                         for i in 4..10 {
-                            storage_keys.push(B256::with_last_byte(i));
+                storage_keys.push(B256::with_last_byte(i));
                         }
                     }
                 }
@@ -881,9 +756,9 @@ impl SgxWasmBlockBuildingAlgorithm {
                 for &slot_key in &storage_keys {
                     if let Ok(Some(value)) = provider.storage(address, slot_key) {
                         storage.push(SerializedStorage {
-                            address,
-                            slot: slot_key,
-                            value: value.into(),
+                address,
+                slot: slot_key,
+                value: value.into(),
                         });
                     }
                 }
@@ -929,8 +804,12 @@ impl SgxWasmBlockBuildingAlgorithm {
                     let inner_tx = tx.internal_tx_unsecure().transaction();
                     let from = tx.signer();
                     let hash = tx.hash();
+                    
+                    let mut encoded_bytes = Vec::new();
+                    tx.internal_tx_unsecure().encode_2718(&mut encoded_bytes);
+                    let encoded_signed_tx = alloy_primitives::Bytes::from(encoded_bytes);
 
-                    let serialized_tx = self.serialize_transaction(inner_tx, from, hash);
+                    let serialized_tx = self.serialize_transaction(inner_tx, from, hash, encoded_signed_tx);
                     transactions.push(serialized_tx);
                 },
 
@@ -941,15 +820,19 @@ impl SgxWasmBlockBuildingAlgorithm {
                         let inner_tx = tx.internal_tx_unsecure().transaction();
                         let from = tx.signer();
                         let hash = tx.hash();
+                        
+                        let mut encoded_bytes = Vec::new();
+                        tx.internal_tx_unsecure().encode_2718(&mut encoded_bytes);
+                        let encoded_signed_tx = alloy_primitives::Bytes::from(encoded_bytes);
 
-                        let serialized_tx = self.serialize_transaction(inner_tx, from, hash);
+                        let serialized_tx = self.serialize_transaction(inner_tx, from, hash, encoded_signed_tx);
                         bundle_transactions.push(serialized_tx);
                     }
 
                     if !bundle_transactions.is_empty() {
                         bundles.push(SerializedBundle {
-                            id: order_id,
-                            transactions: bundle_transactions,
+                id: order_id,
+                transactions: bundle_transactions,
                         });
                     }
                 },
@@ -961,15 +844,19 @@ impl SgxWasmBlockBuildingAlgorithm {
                         let inner_tx = tx.internal_tx_unsecure().transaction();
                         let from = tx.signer();
                         let hash = tx.hash();
+                        
+                        let mut encoded_bytes = Vec::new();
+                        tx.internal_tx_unsecure().encode_2718(&mut encoded_bytes);
+                        let encoded_signed_tx = alloy_primitives::Bytes::from(encoded_bytes);
 
-                        let serialized_tx = self.serialize_transaction(inner_tx, from, hash);
+                        let serialized_tx = self.serialize_transaction(inner_tx, from, hash, encoded_signed_tx);
                         bundle_transactions.push(serialized_tx);
                     }
 
                     if !bundle_transactions.is_empty() {
                         bundles.push(SerializedBundle {
-                            id: order_id,
-                            transactions: bundle_transactions,
+                id: order_id,
+                transactions: bundle_transactions,
                         });
                     }
                 }
@@ -978,7 +865,7 @@ impl SgxWasmBlockBuildingAlgorithm {
 
         (transactions, bundles)
     }
-    fn serialize_transaction(&self, tx: &reth_primitives::Transaction, sender: Address, hash: B256) -> SerializedTransaction {
+    fn serialize_transaction(&self, tx: &reth_primitives::Transaction, sender: Address, hash: B256, encoded_signed_tx: alloy_primitives::Bytes) -> SerializedTransaction {
         let tx_type = match tx.tx_type() {
             alloy_consensus::TxType::Legacy => "Legacy",
             alloy_consensus::TxType::Eip2930 => "AccessList",
@@ -1010,6 +897,7 @@ impl SgxWasmBlockBuildingAlgorithm {
             max_fee_per_gas: Some(U256::from(tx.max_fee_per_gas())),
             max_fee_per_blob_gas: tx.max_fee_per_blob_gas().map(|fee| U256::from(fee)),
             versioned_hashes: Vec::new(),
+            encoded_signed_tx,
         }
     }
     fn convert_block_params(&self, ctx: &BlockBuildingContext) -> BlockParams {
@@ -1024,6 +912,7 @@ impl SgxWasmBlockBuildingAlgorithm {
             withdrawals_root: None,
             blob_gas_used: None,
             excess_blob_gas: None,
+            parent_beacon_block_root: ctx.attributes.parent_beacon_block_root,
         }
     }
     fn create_config(&self, ctx: &BlockBuildingContext) -> BlockBuilderConfig {
@@ -1033,7 +922,7 @@ impl SgxWasmBlockBuildingAlgorithm {
             failed_tx_retries: 1,
             drop_failed_txs: true,
             coinbase_payment: !ctx.coinbase_is_suggested_fee_recipient(),
-            build_timeout_ms: 5000,
+            build_timeout_ms: 10000,
         }
     }
     fn convert_output_to_block(&self, output: BlockBuilderOutput, helper: &dyn BlockBuildingHelper, ctx: &BlockBuildingContext) -> Result<BiddableUnfinishedBlock> {
@@ -1047,18 +936,24 @@ impl SgxWasmBlockBuildingAlgorithm {
         
         for tx_bytes_alloy in &output.transactions {
             let mut tx_bytes_slice: &[u8] = &tx_bytes_alloy.0;
-            if let Ok(tx_signed_reth) = TransactionSigned::decode(&mut tx_bytes_slice) {
-                let recover_result = tx_signed_reth.recover_signer();
-                if let Ok(signer) = recover_result {
-                    let recovered = reth_primitives::Recovered::new_unchecked(tx_signed_reth, signer);
-                    let tx_with_blobs = crate::primitives::TransactionSignedEcRecoveredWithBlobs::new_no_blobs(recovered)
-                        .map_err(|e| eyre!("Failed to create TransactionSignedEcRecoveredWithBlobs: {}", e))?;
-                    executed_txs.push(tx_with_blobs);
-                } else {
-                    warn!("Failed to recover signer for transaction from SGX output");
+            match TransactionSigned::decode(&mut tx_bytes_slice) {
+                Ok(tx_signed_reth) => {
+                    let recover_result = tx_signed_reth.recover_signer();
+                    match recover_result {
+                        Ok(signer) => {
+                let recovered = reth_primitives::Recovered::new_unchecked(tx_signed_reth, signer);
+                let tx_with_blobs = crate::primitives::TransactionSignedEcRecoveredWithBlobs::new_no_blobs(recovered)
+                    .map_err(|e| eyre!("Failed to create TransactionSignedEcRecoveredWithBlobs: {}", e))?;
+                executed_txs.push(tx_with_blobs);
+                        },
+                        Err(e) => {
+                warn!("Failed to recover signer for transaction from SGX output: {}", e);
+                        }
+                    }
+                },
+                Err(e) => {
+                    warn!("Failed to decode transaction from SGX output: {:?}", tx_bytes_alloy);
                 }
-            } else {
-                warn!("Failed to decode transaction from SGX output: {:?}", tx_bytes_alloy);
             }
         }
         
@@ -1117,6 +1012,7 @@ impl SgxWasmBlockBuildingAlgorithm {
             execution_requests,
             output.header.clone(),
             sgx_state_diff,
+            block_trace,
         );
         
         let unfinished_block = block_building_helper::BiddableUnfinishedBlock::new(
@@ -1152,605 +1048,474 @@ where
         let sink = input.sink.clone();
         let cancel = input.cancel.clone();
         let provider = input.provider.clone();
-        
-        let join_set = std::sync::Arc::new(tokio::sync::Mutex::new(
-            tokio::task::JoinSet::new()
-        ));
 
-        let (order_sender, order_receiver) = tokio::sync::broadcast::channel::<SimulatedOrderCommand>(1024);
-        let mut input_receiver = input.input;
+        let block_state: Arc<dyn StateProvider> = match input
+            .provider
+            .history_by_block_hash(input.ctx.attributes.parent)
+        {
+            Ok(state) => Arc::from(state),
+            Err(err) => {
+                error!(
+                    ?err,
+                    payload_id = input.ctx.payload_id,
+                    "Failed to get history_by_block_hash, cancelling SGX WASM builder job"
+                );
+                return;
+            }
+        };
 
+        let nonces = NonceCache::new(block_state.clone());
+        let mut order_intake_consumer =
+            OrderIntakeConsumer::<self::ValidOrderPriority>::new(nonces, input.input);
+
+        #[cfg(feature = "sgx_integration")]
         let mut owned_self = SgxWasmBlockBuildingAlgorithm {
             sgx_builder,
             verifier,
             wasm_path: wasm_path.clone(),
             fallback_to_native,
         };
-        let cancel_token = input.cancel.clone();
-        {
-            let cancel = cancel_token.clone();
-            let join_set_clone = join_set.clone();
-            tokio::spawn(async move {
-                let mut join_set = join_set_clone.lock().await;
-                join_set.spawn(async move {
-                    let cancel = cancel.clone();
-                    let order_receiver = order_receiver;
-                    
-                    info!("[SGX DEBUG] Starting SGX WASM Builder worker loop with dedicated receiver");
-                    
-                    let mut order_batch_count = 0;
-                    let max_empty_iterations = 5;
-                    
-                    let provider_box = match provider.latest() {
-                        Ok(provider) => provider,
-                        Err(e) => {
-                            error!("[SGX DEBUG] Failed to get latest provider for NonceCache: {}", e);
-                            return;
-                        }
-                    };
-                    
-                    let provider_arc = Arc::new(provider_box) as Arc<dyn StateProvider>;
-                    let nonce_cache = NonceCache::new(provider_arc);
-                    
-                    let mut order_intake_consumer =
-                        OrderIntakeConsumer::<self::ValidOrderPriority>::new(
-                            nonce_cache,
-                            order_receiver
-                        );
-                    
-                    loop {
-                        let sleep_duration = if order_batch_count >= max_empty_iterations {
-                            Duration::from_millis(100)
-                        } else {
-                            let backoff_factor = std::cmp::min(order_batch_count, 5) as u64;
-                            Duration::from_millis(500 * (1 + backoff_factor))
-                        };
-                        
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                info!("[SGX DEBUG] Cancellation received, stopping SGX WASM Builder");
-                                break;
+        
+        #[cfg(not(feature = "sgx_integration"))]
+        let owned_self = SgxWasmBlockBuildingAlgorithm {
+            wasm_path: wasm_path.clone(),
+            fallback_to_native,
+        };
+
+        loop {
+            if cancel.is_cancelled() {
+                info!("[SGX DEBUG] Cancellation received, stopping SGX WASM Builder");
+                break;
+            }
+
+            trace!("[SGX DEBUG] Attempting to consume next batch of orders");
+            match order_intake_consumer.blocking_consume_next_batch() {
+                Ok(true) => {
+                    debug!("[SGX DEBUG] Successfully processed batch. Order count: {}",
+                        order_intake_consumer.block_orders.get_all_orders().len());
+                },
+                Ok(false) => {
+                    info!("[SGX DEBUG] Order consumer channel closed, stopping SGX WASM builder");
+                    break;
+                },
+                Err(e) => {
+                    error!("[SGX DEBUG] Failed to consume batch of orders: {}", e);
+                    continue;
+                }
+            };
+
+            let block_orders = order_intake_consumer.current_block_orders();
+
+            trace!("[SGX DEBUG] Getting latest state provider");
+            let state_provider = match provider.latest() {
+                Ok(provider) => {
+                    trace!("[SGX DEBUG] Successfully obtained state provider");
+                    Arc::from(provider) as Arc<dyn StateProvider>
+                },
+                Err(e) => {
+                    error!("[SGX DEBUG] Failed to get latest state provider: {}", e);
+                    continue;
+                }
+            };
+
+            trace!("[SGX DEBUG] Creating block building helper");
+            let helper = match block_building_helper::BlockBuildingHelperFromProvider::new(
+                state_provider.clone(),
+                ctx.clone(),
+                None,
+                name.clone(),
+                true,
+                cancel.clone(),
+            ) {
+                Ok(helper) => {
+                    trace!("[SGX DEBUG] Successfully created block building helper");
+                    helper
+                },
+                Err(e) => {
+                    error!("[SGX DEBUG] Failed to create block building helper: {}", e);
+                    continue;
+                }
+            };
+
+            debug!("[SGX DEBUG] Current block orders count: {}", block_orders.get_all_orders().len());
+            for (i, order) in block_orders.get_all_orders().iter().take(5).enumerate() {
+                debug!("[SGX DEBUG] Order #{}: id={}, type={:?}",
+                    i, order.id(),
+                    match &order.order {
+                        crate::primitives::Order::Tx(_) => "Transaction",
+                        crate::primitives::Order::Bundle(_) => "Bundle",
+                        crate::primitives::Order::ShareBundle(_) => "ShareBundle",
+                    }
+                );
+            }
+
+            info!("[SGX DEBUG] Found {} orders to process, proceeding with block building",
+                block_orders.get_all_orders().len());
+
+            #[cfg(feature = "sgx_integration")]
+            {
+                info!("[SGX DEBUG] Building block using SGX enclave with {} orders", block_orders.get_all_orders().len());
+
+                let mut addresses = Vec::new();
+                let mut access_list_entries: std::collections::HashMap<Address, std::collections::HashSet<B256>> =
+                    std::collections::HashMap::new();
+
+                debug!("[SGX DEBUG] Processing orders to extract addresses and access lists");
+                for (i, order) in block_orders.get_all_orders().iter().enumerate() {
+                    debug!("[SGX DEBUG] Processing order #{} (id={})", i, order.id());
+                    match &order.order {
+                        Order::Tx(tx) => {
+                            debug!("[SGX DEBUG] Order #{} is a transaction", i);
+                            addresses.push(tx.tx_with_blobs.signer());
+
+                            if let Some(to) = tx.tx_with_blobs.to() {
+                                addresses.push(to);
                             }
-                            
-                            _ = tokio::time::sleep(sleep_duration) => {
-                                let ordering_id = OrderingId(format!("sgx-wasm-{}", uuid::Uuid::new_v4()));
-                                order_batch_count += 1;
-                                
-                                let force_build = order_batch_count >= max_empty_iterations;
-                                if force_build {
-                                    info!("[SGX DEBUG] Force block building after {} empty iterations", max_empty_iterations);
-                                }
-                                
-                                if order_batch_count % 2 == 0 {
-                                    debug!("[SGX DEBUG] Iteration #{}/{}: Getting latest state provider", 
-                                           order_batch_count, max_empty_iterations);
-                                } else {
-                                    trace!("[SGX DEBUG] Iteration #{}/{}: Getting latest state provider", 
-                                           order_batch_count, max_empty_iterations);
-                                }
-                                
-                                let state_provider = match provider.latest() {
-                                    Ok(provider) => {
-                                        trace!("[SGX DEBUG] Successfully obtained state provider");
-                                        Arc::from(provider) as Arc<dyn StateProvider>
-                                    },
-                                    Err(e) => {
-                                        error!("[SGX DEBUG] Failed to get latest state provider: {}", e);
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
-                                        continue;
-                                    }
-                                };
-                                
-                                trace!("[SGX DEBUG] Creating block building helper");
-                                let helper = match block_building_helper::BlockBuildingHelperFromProvider::new(
-                                    state_provider.clone(),
-                                    ctx.clone(),
-                                    None,
-                                    name.clone(),
-                                    true,
-                                    cancel.clone(), 
-                                ) {
-                                    Ok(helper) => {
-                                        trace!("[SGX DEBUG] Successfully created block building helper");
-                                        helper
-                                    },
-                                    Err(e) => {
-                                        error!("[SGX DEBUG] Failed to create block building helper: {}", e);
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
-                                        continue;
-                                    }
-                                };
-                            
-                                trace!("[SGX DEBUG] Attempting to consume next batch of orders");
-                                match order_intake_consumer.try_consume_next_batch() {
-                                    Ok(true) => {
-                                        order_batch_count = 0;
-                                        debug!("[SGX DEBUG] Successfully processed batch. Order count: {}", 
-                                            order_intake_consumer.block_orders.get_all_orders().len());
-                                    },
-                                    Ok(false) => {
-                                        info!("[SGX DEBUG] Order consumer channel closed, stopping SGX WASM builder");
-                                        cancel.cancel();
-                                        break;
-                                    },
-                                    Err(e) => {
-                                        error!("[SGX DEBUG] Failed to consume batch of orders: {}", e);
-                                        tokio::time::sleep(Duration::from_millis(500)).await;
-                                        continue;
-                                    }
-                                };
-                                
-                                if order_intake_consumer.block_orders.is_empty() && !force_build {
-                                    if order_batch_count % 2 == 0 {
-                                        debug!("[SGX DEBUG] No validated orders to process (iteration {}/{})", 
-                                               order_batch_count, max_empty_iterations);
-                                    } else {
-                                        trace!("[SGX DEBUG] No validated orders to process (iteration {}/{})", 
-                                               order_batch_count, max_empty_iterations);
-                                    }
-                                    continue;
-                                }
-                            
-                                let block_orders = order_intake_consumer.current_block_orders();
-                                
-                                if block_orders.is_empty() && !force_build {
-                                    debug!("[SGX DEBUG] No block orders available (iteration {}/{})", 
-                                           order_batch_count, max_empty_iterations);
-                                    continue;
-                                }
-                                
-                                if force_build && block_orders.is_empty() {
-                                    info!("[SGX DEBUG] Building empty block to avoid test timeout");
-                                    order_batch_count = 0;
-                                }
-                                
-                                debug!("[SGX DEBUG] Current block orders count: {}", block_orders.get_all_orders().len());
-                                for (i, order) in block_orders.get_all_orders().iter().take(5).enumerate() {
-                                    debug!("[SGX DEBUG] Order #{}: id={}, type={:?}", 
-                                        i, order.id(), 
-                                        match &order.order {
-                                            crate::primitives::Order::Tx(_) => "Transaction",
-                                            crate::primitives::Order::Bundle(_) => "Bundle",
-                                            crate::primitives::Order::ShareBundle(_) => "ShareBundle",
-                                        }
-                                    );
-                                }
-                                
-                                info!("[SGX DEBUG] Found {} orders to process, proceeding with block building", 
-                                    block_orders.get_all_orders().len());
-                                
-                                #[cfg(feature = "sgx_integration")]
-                                {
-                                    info!("[SGX DEBUG] Building block using SGX enclave with {} orders", block_orders.get_all_orders().len());
-                            
-                                    let mut addresses = Vec::new();
-                                    let mut access_list_entries: std::collections::HashMap<Address, std::collections::HashSet<B256>> =
-                                        std::collections::HashMap::new();
-                            
-                                    debug!("[SGX DEBUG] Processing orders to extract addresses and access lists");
-                                    for (i, order) in block_orders.get_all_orders().iter().enumerate() {
-                                        debug!("[SGX DEBUG] Processing order #{} (id={})", i, order.id());
-                                        match &order.order {
-                                            Order::Tx(tx) => {
-                                                debug!("[SGX DEBUG] Order #{} is a transaction", i);
-                                                addresses.push(tx.tx_with_blobs.signer());
-                            
-                                                if let Some(to) = tx.tx_with_blobs.to() {
-                                                    addresses.push(to);
-                                                }
-                            
-                                                let inner_tx = tx.tx_with_blobs.internal_tx_unsecure().transaction();
-                                                if let Some(access_list) = inner_tx.access_list() {
-                                                    for item in &access_list.0 {
-                                                        addresses.push(item.address);
-                            
-                                                        access_list_entries
-                                                            .entry(item.address)
-                                                            .or_insert_with(std::collections::HashSet::new)
-                                                            .extend(item.storage_keys.iter().cloned());
-                                                    }
-                                                }
-                                            },
-                                            Order::Bundle(bundle) => {
-                                                debug!("[SGX DEBUG] Order #{} is a bundle with {} transactions", i, bundle.list_txs().len());
-                                                for (tx_idx, (tx, _)) in bundle.list_txs().iter().enumerate() {
-                                                    debug!("[SGX DEBUG] Processing bundle tx #{} in order #{}", tx_idx, i);
-                                                    addresses.push(tx.signer());
-                            
-                                                    if let Some(to) = tx.to() {
-                                                        addresses.push(to);
-                                                    }
-                            
-                                                    let inner_tx = tx.internal_tx_unsecure().transaction();
-                                                    if let Some(access_list) = inner_tx.access_list() {
-                                                        for item in &access_list.0 {
-                                                            addresses.push(item.address);
-                            
-                                                            access_list_entries
-                                                                .entry(item.address)
-                                                                .or_insert_with(std::collections::HashSet::new)
-                                                                .extend(item.storage_keys.iter().cloned());
-                                                        }
-                                                    }
-                                                }
-                                            },
-                                            Order::ShareBundle(share_bundle) => {
-                                                debug!("[SGX DEBUG] Order #{} is a share bundle with {} transactions", i, share_bundle.list_txs().len());
-                                                for (tx_idx, (tx, _)) in share_bundle.list_txs().iter().enumerate() {
-                                                    debug!("[SGX DEBUG] Processing share bundle tx #{} in order #{}", tx_idx, i);
-                                                    addresses.push(tx.signer());
-                            
-                                                    if let Some(to) = tx.to() {
-                                                        addresses.push(to);
-                                                    }
-                            
-                                                    let inner_tx = tx.internal_tx_unsecure().transaction();
-                                                    if let Some(access_list) = inner_tx.access_list() {
-                                                        for item in &access_list.0 {
-                                                            addresses.push(item.address);
-                            
-                                                            access_list_entries
-                                                                .entry(item.address)
-                                                                .or_insert_with(std::collections::HashSet::new)
-                                                                .extend(item.storage_keys.iter().cloned());
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                            
-                                    if !access_list_entries.is_empty() {
-                                        debug!(
-                                            "Collected access list entries for {} addresses with a total of {} storage keys",
-                                            access_list_entries.len(),
-                                            access_list_entries.values().map(|keys| keys.len()).sum::<usize>()
-                                        );
-                                    }
-                            
-                                    debug!("Extracting state data for {} addresses", addresses.len());
-                            
-                                    if !access_list_entries.is_empty() {
-                                        debug!("Including {} storage keys from transaction access lists",
-                                            access_list_entries.values().map(|keys| keys.len()).sum::<usize>());
-                                    }
-                            
-                                    addresses.sort();
-                                    addresses.dedup();
-                                    let block_number = ctx.evm_env.block_env.number.to::<u64>();
-                                    let (accounts, mut storage, code) = owned_self.extract_state_data(&provider, block_number, &addresses)
-                                        .unwrap_or_else(|e| {
-                                            error!("Failed to extract state data: {}", e);
-                                            (Vec::new(), Vec::new(), Vec::new())
-                                        });
-                            
-                                    debug!("Extracted {} accounts, {} storage slots, and {} code entries",
-                                        accounts.len(), storage.len(), code.len());
-                            
-                                    let mut additional_storage = Vec::new();
-                                    for (address, keys) in &access_list_entries {
-                                        for &key in keys {
-                                            if let Ok(Some(value)) = state_provider.storage(*address, key) {
-                                                additional_storage.push(SerializedStorage {
-                                                    address: *address,
-                                                    slot: key,
-                                                    value: value.into(),
-                                                });
-                                            }
-                                        }
-                                    }
-                            
-                                    if !additional_storage.is_empty() {
-                                        debug!("Adding {} additional storage slots from access lists", additional_storage.len());
-                                        storage.extend(additional_storage);
-                                    }
-                            
-                                    let mut serialized_data = BlockBuilderInput {
-                                        block_params: owned_self.convert_block_params(&ctx),
-                                        accounts,
-                                        storage,
-                                        code,
-                                        transactions: Vec::new(),
-                                        bundles: Vec::new(),
-                                        config: owned_self.create_config(&ctx),
-                                    };
-                            
-                                    let (transactions, bundles) = owned_self.convert_orders(&block_orders);
-                                    serialized_data.transactions = transactions;
-                                    serialized_data.bundles = bundles;
-                            
-                                    debug!("[SGX DEBUG] Serializing block data to JSON");
-                                    let orders_json = match serde_json::to_string(&serialized_data) {
-                                        Ok(json) => {
-                                            debug!("[SGX DEBUG] Successfully serialized orders to JSON: {} bytes", json.len());
-                                            json
-                                        },
-                                        Err(e) => {
-                                            error!("[SGX DEBUG] Failed to serialize orders for SGX: {}", e);
-                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                            continue;
-                                        }
-                                    };
-                                    
-                                    debug!("[SGX DEBUG] Calling SGX build_block with input JSON of size: {} bytes", orders_json.len());
-                                            debug!("[SGX DEBUG] Input JSON preview: {}", orders_json);
 
-                                    match owned_self.sgx_builder.build_block(&orders_json) {
-                                        Ok(output_json) => {
-                                            debug!("[SGX DEBUG] SGX block building completed successfully, output size: {} bytes", output_json.len());
-                                            
-                                            debug!("[SGX DEBUG] Starting signature verification");
-                                            debug!("[SGX DEBUG] Output JSON preview: {}", output_json);
-                                            match owned_self.verifier.verify(&output_json) {
-                                                Ok(_) => {
-                                                    debug!("[SGX DEBUG] Successfully verified SGX enclave signature");
-                                                    debug!("[SGX DEBUG] Parsing output JSON into BlockBuilderOutput");
-                                                    match serde_json::from_str::<BlockBuilderOutput>(&output_json) {
-                                                        Ok(output) => {
-                                                            debug!("[SGX DEBUG] Successfully parsed SGX output JSON");
-                                                            info!("[SGX DEBUG] Metrics from SGX enclave output: block_value={}, tx_count={}, blob_count={}, gas_used={}, blob_gas_used={}, orders_included={}, orders_failed={}, build_time_us={}", 
-                                                                output.metrics.block_value, 
-                                                                output.metrics.tx_count,
-                                                                output.metrics.blob_count,
-                                                                output.metrics.gas_used,
-                                                                output.metrics.blob_gas_used.unwrap_or_default(),
-                                                                output.metrics.trace.as_ref().map_or(0, |t| t.orders_included),
-                                                                output.metrics.trace.as_ref().map_or(0, |t| t.orders_failed),
-                                                                output.metrics.build_time_us);
-                                                            
-                                                            if let Some(trace) = &output.metrics.trace {
-                                                                crate::telemetry::add_block_fill_time(
-                                                                    Duration::from_micros(trace.sim_time_us),
-                                                                    "SGX-WASM-Builder",
-                                                                    ctx.timestamp()
-                                                                );
-                                                                
-                                                                add_histogram_value_in_tests(
-                                                                    "sgx_wasm_builder.sim_time_us",
-                                                                    trace.sim_time_us as f64
-                                                                );
-                                                                add_histogram_value_in_tests(
-                                                                    "sgx_wasm_builder.root_hash_time_us", 
-                                                                    trace.root_hash_time_us as f64
-                                                                );
-                                                                add_histogram_value_in_tests(
-                                                                    "sgx_wasm_builder.finalize_time_us", 
-                                                                    trace.finalize_time_us as f64
-                                                                );
-                                                                add_histogram_value_in_tests(
-                                                                    "sgx_wasm_builder.ordering_time_us", 
-                                                                    trace.ordering_time_us as f64
-                                                                );
-                                                                
-                                                                add_counter_value_in_tests(
-                                                                    "sgx_wasm_builder.orders_considered", 
-                                                                    trace.orders_considered as u64
-                                                                );
-                                                                add_counter_value_in_tests(
-                                                                    "sgx_wasm_builder.orders_included", 
-                                                                    trace.orders_included as u64
-                                                                );
-                                                                add_counter_value_in_tests(
-                                                                    "sgx_wasm_builder.orders_failed", 
-                                                                    trace.orders_failed as u64
-                                                                );
-                                                            }
-                                                            
-                                                            let block_value_f64 = output.metrics.block_value.to_string()
-                                                                .parse::<f64>()
-                                                                .unwrap_or(0.0);
-                                                            
-                                                            add_histogram_value_in_tests(
-                                                                "sgx_wasm_builder.block_value", 
-                                                                block_value_f64
-                                                            );
-                                                            add_counter_value_in_tests(
-                                                                "sgx_wasm_builder.gas_used", 
-                                                                output.metrics.gas_used
-                                                            );
-                                                            add_counter_value_in_tests(
-                                                                "sgx_wasm_builder.tx_count", 
-                                                                output.metrics.tx_count as u64
-                                                            );
-                                                            
-                                                            debug!("[SGX DEBUG] Converting SGX output to block");
-                                                            match owned_self.convert_output_to_block(output, &helper, &ctx) {
-                                                                Ok(block) => {
-                                                                    debug!("[SGX DEBUG] Successfully converted SGX output to block");
-                                                                    let block_value = block.true_block_value();
-                                                                    info!("[SGX DEBUG] Built block with value: {}", block_value);
-                                                                    
-                                                                    info!("[SGX DEBUG] Sending block directly to sink");
-                                                                    let block_value_str = block.true_block_value().to_string();
-                                                                    tracing::info!(
-                                                                        "[SGX DEBUG] About to send block with value {} to sink (type: {})",
-                                                                        block_value_str,
-                                                                        std::any::type_name_of_val(&sink)
-                                                                    );
-                                                                    sink.new_block(block);
-                                                                    debug!("[SGX DEBUG] Block sent to sink");
-                                                                    return;
-                                                                },
-                                                                Err(e) => {
-                                                                    error!("[SGX DEBUG] Failed to convert SGX output to block: {}", e);
-                                                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                                                    continue;
-                                                                }
-                                                            }
-                                                        },
-                                                        Err(e) => {
-                                                            error!("[SGX DEBUG] Failed to parse SGX output: {}", e);
-                                                            error!("[SGX DEBUG] SGX output JSON preview (first 100 chars): {}", 
-                                                                output_json.chars().take(100).collect::<String>());
-                                                            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                                            continue;
-                                                        }
-                                                    }
-                                                },
-                                                Err(e) => {
-                                                    error!("[SGX DEBUG] SGX signature verification failed: {}", e);
-                                                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                                    continue;
-                                                }
-                                            }
-                                        },
-                                        Err(e) => {
-                                            error!("[SGX DEBUG] Failed to build block with SGX: {}", e);
-                                            
-                                            debug!("[SGX DEBUG] SGX build error occurred, serialized_data: accounts={}, storage={}, code={}, transactions={}, bundles={}", 
-                                                serialized_data.accounts.len(),
-                                                serialized_data.storage.len(),
-                                                serialized_data.code.len(),
-                                                serialized_data.transactions.len(),
-                                                serialized_data.bundles.len()
+                            let inner_tx = tx.tx_with_blobs.internal_tx_unsecure().transaction();
+                            if let Some(access_list) = inner_tx.access_list() {
+                                for item in &access_list.0 {
+                                    addresses.push(item.address);
+
+                                    access_list_entries
+                                        .entry(item.address)
+                                        .or_insert_with(std::collections::HashSet::new)
+                                        .extend(item.storage_keys.iter().cloned());
+                                }
+                            }
+                        },
+                        Order::Bundle(bundle) => {
+                            debug!("[SGX DEBUG] Order #{} is a bundle with {} transactions", i, bundle.list_txs().len());
+                            for (tx_idx, (tx, _)) in bundle.list_txs().iter().enumerate() {
+                                debug!("[SGX DEBUG] Processing bundle tx #{} in order #{}", tx_idx, i);
+                                addresses.push(tx.signer());
+
+                                if let Some(to) = tx.to() {
+                                    addresses.push(to);
+                                }
+
+                                let inner_tx = tx.internal_tx_unsecure().transaction();
+                                if let Some(access_list) = inner_tx.access_list() {
+                                    for item in &access_list.0 {
+                                        addresses.push(item.address);
+
+                                        access_list_entries
+                                            .entry(item.address)
+                                            .or_insert_with(std::collections::HashSet::new)
+                                            .extend(item.storage_keys.iter().cloned());
+                                    }
+                                }
+                            }
+                        },
+                        Order::ShareBundle(share_bundle) => {
+                            debug!("[SGX DEBUG] Order #{} is a share bundle with {} transactions", i, share_bundle.list_txs().len());
+                            for (tx_idx, (tx, _)) in share_bundle.list_txs().iter().enumerate() {
+                                debug!("[SGX DEBUG] Processing share bundle tx #{} in order #{}", tx_idx, i);
+                                addresses.push(tx.signer());
+
+                                if let Some(to) = tx.to() {
+                                    addresses.push(to);
+                                }
+
+                                let inner_tx = tx.internal_tx_unsecure().transaction();
+                                if let Some(access_list) = inner_tx.access_list() {
+                                    for item in &access_list.0 {
+                                        addresses.push(item.address);
+
+                                        access_list_entries
+                                            .entry(item.address)
+                                            .or_insert_with(std::collections::HashSet::new)
+                                            .extend(item.storage_keys.iter().cloned());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !access_list_entries.is_empty() {
+                    debug!(
+                        "Collected access list entries for {} addresses with a total of {} storage keys",
+                        access_list_entries.len(),
+                        access_list_entries.values().map(|keys| keys.len()).sum::<usize>()
+                    );
+                }
+
+                debug!("Extracting state data for {} addresses", addresses.len());
+
+                if !access_list_entries.is_empty() {
+                    debug!("Including {} storage keys from transaction access lists",
+                        access_list_entries.values().map(|keys| keys.len()).sum::<usize>());
+                }
+
+                addresses.sort();
+                addresses.dedup();
+                let block_number = ctx.evm_env.block_env.number.to::<u64>();
+                let (accounts, mut storage, code) = owned_self.extract_state_data(&provider, block_number, &addresses)
+                    .unwrap_or_else(|e| {
+                        error!("Failed to extract state data: {}", e);
+                        (Vec::new(), Vec::new(), Vec::new())
+                    });
+
+                debug!("Extracted {} accounts, {} storage slots, and {} code entries",
+                    accounts.len(), storage.len(), code.len());
+
+                let mut additional_storage = Vec::new();
+                for (address, keys) in &access_list_entries {
+                    for &key in keys {
+                        if let Ok(Some(value)) = state_provider.storage(*address, key) {
+                            additional_storage.push(SerializedStorage {
+                                address: *address,
+                                slot: key,
+                                value: value.into(),
+                            });
+                        }
+                    }
+                }
+
+                if !additional_storage.is_empty() {
+                    debug!("Adding {} additional storage slots from access lists", additional_storage.len());
+                    storage.extend(additional_storage);
+                }
+
+                let mut serialized_data = BlockBuilderInput {
+                    block_params: owned_self.convert_block_params(&ctx),
+                    accounts,
+                    storage,
+                    code,
+                    transactions: Vec::new(),
+                    bundles: Vec::new(),
+                    config: owned_self.create_config(&ctx),
+                };
+
+                let (transactions, bundles) = owned_self.convert_orders(&block_orders);
+                serialized_data.transactions = transactions;
+                serialized_data.bundles = bundles;
+
+                debug!("[SGX DEBUG] Serializing block data to JSON");
+                let orders_json = match serde_json::to_string(&serialized_data) {
+                    Ok(json) => {
+                        debug!("[SGX DEBUG] Successfully serialized orders to JSON: {} bytes", json.len());
+                        json
+                    },
+                    Err(e) => {
+                        error!("[SGX DEBUG] Failed to serialize orders for SGX: {}", e);
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        continue;
+                    }
+                };
+
+                debug!("[SGX DEBUG] Calling SGX build_block with input JSON of size: {} bytes", orders_json.len());
+                debug!("[SGX DEBUG] Input JSON preview: {}", orders_json);
+
+                match owned_self.sgx_builder.build_block(&orders_json) {
+                    Ok(output_json) => {
+                        debug!("[SGX DEBUG] SGX block building completed successfully, output size: {} bytes", output_json.len());
+
+                        debug!("[SGX DEBUG] Starting signature verification");
+                        debug!("[SGX DEBUG] Output JSON preview: {}", output_json);
+                        match owned_self.verifier.verify(&output_json) {
+                            Ok(_) => {
+                                debug!("[SGX DEBUG] Successfully verified SGX enclave signature");
+                                debug!("[SGX DEBUG] Parsing output JSON into BlockBuilderOutput");
+                                match serde_json::from_str::<BlockBuilderOutput>(&output_json) {
+                                    Ok(output) => {
+                                        debug!("[SGX DEBUG] Successfully parsed SGX output JSON");
+                                        info!("[SGX DEBUG] Metrics from SGX enclave output: block_value={}, tx_count={}, blob_count={}, gas_used={}, blob_gas_used={}, orders_included={}, orders_failed={}, build_time_us={}",
+                                            output.metrics.block_value,
+                                            output.metrics.tx_count,
+                                            output.metrics.blob_count,
+                                            output.metrics.gas_used,
+                                            output.metrics.blob_gas_used.unwrap_or_default(),
+                                            output.metrics.trace.as_ref().map_or(0, |t| t.orders_included),
+                                            output.metrics.trace.as_ref().map_or(0, |t| t.orders_failed),
+                                            output.metrics.build_time_us);
+
+                                        if let Some(trace) = &output.metrics.trace {
+                                            crate::telemetry::add_block_fill_time(
+                                                Duration::from_micros(trace.sim_time_us),
+                                                "SGX-WASM-Builder",
+                                                ctx.timestamp()
                                             );
-                                            
-                                            if fallback_to_native {
-                                                warn!("[SGX DEBUG] Falling back to native block building due to SGX error");
-                                                debug!("[SGX DEBUG] Creating fallback block with SgxWasmBlockBuildingHelper");
-                                                let fallback_helper = SgxWasmBlockBuildingHelper::new(
-                                                    format!("{}-fallback", name),
-                                                    U256::from(0),
-                                                    ctx.clone(),
-                                                    Vec::new(),
-                                                    Vec::new(),
-                                                    Vec::new(),
-                                                    Vec::new(),
-                                                    SerializedHeader {
-                                                        parent_hash: B256::default(),
-                                                        number: 0,
-                                                        timestamp: 0,
-                                                        coinbase: Address::default(),
-                                                        difficulty: alloy_primitives::U256::ZERO,
-                                                        gas_limit: 0,
-                                                        gas_used: 0,
-                                                        base_fee_per_gas: alloy_primitives::U256::ZERO,
-                                                        extra_data: alloy_primitives::Bytes::default(),
-                                                        state_root: B256::default(),
-                                                        transactions_root: B256::default(),
-                                                        receipts_root: B256::default(),
-                                                        logs_bloom: [0u8; 256],
-                                                        mix_hash: B256::default(),
-                                                        withdrawals_root: None,
-                                                        blob_gas_used: None,
-                                                        excess_blob_gas: None,
-                                                    },
-                                                    SerializedStateDiff {
-                                                        accounts: Vec::new(),
-                                                        storage: Vec::new(),
-                                                        code: Vec::new(),
-                                                    },
-                                                );
-                                                debug!("[SGX DEBUG] Initializing BiddableUnfinishedBlock with fallback helper");
-                                                let fallback_block = match block_building_helper::BiddableUnfinishedBlock::new(Box::new(fallback_helper)) {
-                                                    Ok(block) => {
-                                                        debug!("[SGX DEBUG] Successfully created fallback BiddableUnfinishedBlock");
-                                                        block
-                                                    },
-                                                    Err(e) => {
-                                                        error!("[SGX DEBUG] Failed to create fallback BiddableUnfinishedBlock: {}", e);
-                                                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                                                        continue;
-                                                    }
-                                                };
-                                                info!("[SGX DEBUG] Using fallback block directly");
-                                                
-                                                let block_value = fallback_block.true_block_value();
-                                                
-                                                info!("[SGX DEBUG] Fallback block with value: {}", block_value);
-                                                debug!("[SGX DEBUG] Sending fallback block directly to sink");
-                                                
-                                                std::thread::sleep(std::time::Duration::from_millis(100));
 
-                                                sink.new_block(fallback_block);
-                                                debug!("[SGX DEBUG] Fallback block sent to sink");
+                                            add_histogram_value_in_tests(
+                                                "sgx_wasm_builder.sim_time_us",
+                                                trace.sim_time_us as f64
+                                            );
+                                            add_histogram_value_in_tests(
+                                                "sgx_wasm_builder.root_hash_time_us",
+                                                trace.root_hash_time_us as f64
+                                            );
+                                            add_histogram_value_in_tests(
+                                                "sgx_wasm_builder.finalize_time_us",
+                                                trace.finalize_time_us as f64
+                                            );
+                                            add_histogram_value_in_tests(
+                                                "sgx_wasm_builder.ordering_time_us",
+                                                trace.ordering_time_us as f64
+                                            );
+
+                                            add_counter_value_in_tests(
+                                                "sgx_wasm_builder.orders_considered",
+                                                trace.orders_considered as u64
+                                            );
+                                            add_counter_value_in_tests(
+                                                "sgx_wasm_builder.orders_included",
+                                                trace.orders_included as u64
+                                            );
+                                            add_counter_value_in_tests(
+                                                "sgx_wasm_builder.orders_failed",
+                                                trace.orders_failed as u64
+                                            );
+                                        }
+
+                                        let block_value_f64 = output.metrics.block_value.to_string()
+                                            .parse::<f64>()
+                                            .unwrap_or(0.0);
+
+                                        add_histogram_value_in_tests(
+                                            "sgx_wasm_builder.block_value",
+                                            block_value_f64
+                                        );
+                                        add_counter_value_in_tests(
+                                            "sgx_wasm_builder.gas_used",
+                                            output.metrics.gas_used
+                                        );
+                                        add_counter_value_in_tests(
+                                            "sgx_wasm_builder.tx_count",
+                                            output.metrics.tx_count as u64
+                                        );
+
+                                        debug!("[SGX DEBUG] Converting SGX output to block");
+                                        match owned_self.convert_output_to_block(output, &helper, &ctx) {
+                                            Ok(block) => {
+                                                debug!("[SGX DEBUG] Successfully converted SGX output to block");
+                                                let block_value = block.true_block_value();
+                                                info!("[SGX DEBUG] Built block with value: {}", block_value);
+
+                                                info!("[SGX DEBUG] Sending block directly to sink");
+                                                let block_value_str = block.true_block_value().to_string();
+                                                tracing::info!(
+                                            "[SGX DEBUG] About to send block with value {} to sink (type: {})",
+                                            block_value_str,
+                                            std::any::type_name_of_val(&sink)
+                                                );
+                                                sink.new_block(block);
+                                                debug!("[SGX DEBUG] Block sent to sink");
                                                 return;
-                                            } else {
-                                                debug!("[SGX DEBUG] No fallback to native option, continuing without creating a block");
-                                                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                                            },
+                                            Err(e) => {
+                                                error!("[SGX DEBUG] Failed to convert SGX output to block: {}", e);
+                                                std::thread::sleep(std::time::Duration::from_millis(100));
                                                 continue;
                                             }
                                         }
+                                    },
+                                    Err(e) => {
+                                        error!("[SGX DEBUG] Failed to parse SGX output: {}", e);
+                                        error!("[SGX DEBUG] SGX output JSON preview (first 100 chars): {}",
+                                            output_json.chars().take(100).collect::<String>());
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                        continue;
                                     }
                                 }
+                            },
+                            Err(e) => {
+                                error!("[SGX DEBUG] SGX signature verification failed: {}", e);
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
                             }
                         }
-                    }
-                });
-            });
-        }
+                    },
+                    Err(e) => {
+                        error!("[SGX DEBUG] Failed to build block with SGX: {}", e);
 
-        {
-            let cancel = cancel_token.clone();
-            let join_set_clone = join_set.clone();
-            tokio::spawn(async move {
-                let mut join_set = join_set_clone.lock().await;
-                join_set.spawn(async move {
-                    let cancel = cancel.clone();
-                    
-                    info!("[SGX DEBUG] Starting order forwarding task");
-                    loop {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                info!("[SGX DEBUG] Cancellation received, stopping order forwarding task");
-                                break;
-                            }
-                            
-                            cmd_result = input_receiver.recv() => {
-                                match cmd_result {
-                                    Ok(cmd) => {
-                                        match order_sender.send(cmd) {
-                                            Ok(_) => {},
-                                            Err(tokio::sync::broadcast::error::SendError(cmd)) => {
-                                                warn!("[SGX DEBUG] Failed to forward order (no receivers): {:?}", cmd);
-                                                if order_sender.receiver_count() == 0 {
-                                                    warn!("[SGX DEBUG] All receivers were dropped, creating a new one");
-                                                    let _ = order_sender.subscribe();
-                                                }
-                                            }
-                                        }
-                                    },
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                                        info!("[SGX DEBUG] Input channel closed, stopping order forwarding task");
-                                        cancel.cancel();
-                                        break;
-                                    },
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                                        warn!("[SGX DEBUG] Message forwarding lagged by {} messages", n);
-                                    }
+                        debug!("[SGX DEBUG] SGX build error occurred, serialized_data: accounts={}, storage={}, code={}, transactions={}, bundles={}",
+                    serialized_data.accounts.len(),
+                    serialized_data.storage.len(),
+                    serialized_data.code.len(),
+                    serialized_data.transactions.len(),
+                    serialized_data.bundles.len()
+                        );
+
+                        if fallback_to_native {
+                            warn!("[SGX DEBUG] Falling back to native block building due to SGX error");
+                            debug!("[SGX DEBUG] Creating fallback block with SgxWasmBlockBuildingHelper");
+                            let fallback_helper = SgxWasmBlockBuildingHelper::new(
+                                format!("{}-fallback", name),
+                                U256::from(0),
+                                ctx.clone(),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                AlloyHeader {
+                                    parent_hash: B256::default(),
+                                    ommers_hash: EMPTY_ROOT_HASH,
+                                    beneficiary: Address::default(),
+                                    state_root: B256::default(),
+                                    transactions_root: B256::default(),
+                                    receipts_root: B256::default(),
+                                    logs_bloom: alloy_primitives::Bloom::ZERO,
+                                    difficulty: alloy_primitives::U256::ZERO.into(),
+                                    number: 0,
+                                    gas_limit: 0u64.into(),
+                                    gas_used: 0u64.into(),
+                                    timestamp: 0,
+                                    extra_data: alloy_primitives::Bytes::default(),
+                                    mix_hash: B256::default(),
+                                    nonce: FixedBytes::ZERO,
+                                    base_fee_per_gas: Some(0),
+                                    withdrawals_root: None,
+                                    blob_gas_used: None,
+                                    excess_blob_gas: None,
+                                    parent_beacon_block_root: None,
+                                    requests_hash: None,
+                                },
+                                SerializedStateDiff {
+                                    accounts: Vec::new(),
+                                    storage: Vec::new(),
+                                    code: Vec::new(),
+                                },
+                                BuiltBlockTrace::new(),
+                            );
+                            debug!("[SGX DEBUG] Initializing BiddableUnfinishedBlock with fallback helper");
+                            let fallback_block = match block_building_helper::BiddableUnfinishedBlock::new(Box::new(fallback_helper)) {
+                                Ok(block) => {
+                                    debug!("[SGX DEBUG] Successfully created fallback BiddableUnfinishedBlock");
+                                    block
+                                },
+                                Err(e) => {
+                                    error!("[SGX DEBUG] Failed to create fallback BiddableUnfinishedBlock: {}", e);
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    continue;
                                 }
-                            }
-                        }
-                    }
-                    info!("[SGX DEBUG] Order forwarding task terminated");
-                });
-            });
-        }
+                            };
+                            info!("[SGX DEBUG] Using fallback block directly");
 
-        let cancel = cancel_token.clone();
-        let join_set_clone = join_set.clone();
-        
-        tokio::spawn(async move {
-            cancel.cancelled().await;
-            info!("[SGX DEBUG] Cancellation received, cleaning up tasks");
-            
-            let mut join_set_guard = join_set_clone.lock().await;
-            
-            join_set_guard.abort_all();
-            while let Some(res) = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                join_set_guard.join_next()
-            ).await.ok().flatten() {
-                if let Err(e) = res {
-                    if e.is_cancelled() {
-                        debug!("[SGX DEBUG] Task was properly cancelled");
-                    } else {
-                        warn!("[SGX DEBUG] Task failed during cleanup: {}", e);
+                            let block_value = fallback_block.true_block_value();
+
+                            info!("[SGX DEBUG] Fallback block with value: {}", block_value);
+                            debug!("[SGX DEBUG] Sending fallback block directly to sink");
+
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+
+                            sink.new_block(fallback_block);
+                            debug!("[SGX DEBUG] Fallback block sent to sink");
+                            return;
+                        } else {
+                            debug!("[SGX DEBUG] No fallback to native option, continuing without creating a block");
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            continue;
+                        }
                     }
                 }
             }
-            
-            info!("[SGX DEBUG] All tasks cleaned up successfully");
-        });
+            #[cfg(not(feature = "sgx_integration"))]
+            {
+                warn!("[SGX DEBUG] SGX integration not enabled, creating empty fallback block");
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
     }
 }

@@ -19,6 +19,7 @@ members = [
     "crates/test-relay",
     "crates/wasm-block-builder",
     "crates/sgx-wasm-runner",
+    "crates/block-builder-types",
 ]
 default-members = ["crates/rbuilder", "crates/reth-rbuilder", "crates/test-relay"]
 resolver = "2"
@@ -122,7 +123,7 @@ alloy-network = { version = "0.11.1" }
 alloy-network-primitives = { version = "0.11.1" }
 alloy-transport = { version = "0.11.1" }
 alloy-node-bindings = { version = "0.11.1" }
-alloy-consensus = { version = "0.11.1", features = ["kzg"] }
+alloy-consensus = { version = "0.11.1", features = ["kzg", "serde"] }
 alloy-serde = { version = "0.11.1" }
 alloy-rpc-types-beacon = { version = "0.11.1", features = ["ssz"] }
 alloy-rpc-types-engine = { version = "0.11.1", features = ["ssz"] }

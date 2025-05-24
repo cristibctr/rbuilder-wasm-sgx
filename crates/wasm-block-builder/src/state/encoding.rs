@@ -8,7 +8,7 @@ use log::debug;
 
 use super::diff::{
     EnhancedAccountDiff, EnhancedCodeDiff, EnhancedStateDiff, EnhancedStorageDiff,
-    SlotChange, SlotStatus,
+    SlotChange, SlotStatus, AccountValueStatus, AccountStatus,
 };
 use super::collector::CompressionLevel;
 
@@ -134,8 +134,8 @@ impl DiffEncoder {
             
             if let Some((balance, status)) = &account.balance {
                 result.push(1u8); 
-                result.extend_from_slice(&balance.to_be_bytes());
-                result.push(status_to_u8(status));
+                result.extend_from_slice(&balance.to_be_bytes::<32>());
+                result.push(Self::status_to_u8(status));
             } else {
                 result.push(0u8); 
             }
@@ -143,7 +143,7 @@ impl DiffEncoder {
             if let Some((nonce, status)) = &account.nonce {
                 result.push(1u8); 
                 result.extend_from_slice(&nonce.to_be_bytes());
-                result.push(status_to_u8(status));
+                result.push(Self::status_to_u8(status));
             } else {
                 result.push(0u8); 
             }
@@ -151,7 +151,7 @@ impl DiffEncoder {
             if let Some((code_hash, status)) = &account.code_hash {
                 result.push(1u8); 
                 result.extend_from_slice(code_hash.as_slice());
-                result.push(status_to_u8(status));
+                result.push(Self::status_to_u8(status));
             } else {
                 result.push(0u8); 
             }
@@ -298,8 +298,8 @@ impl DiffEncoder {
                 AccountStatus::Created | AccountStatus::Modified => {
                     if let Some((balance, status)) = &account.balance {
                         result.push(1u8); 
-                        result.extend_from_slice(&balance.to_be_bytes());
-                        result.push(self.status_to_u8(status));
+                        result.extend_from_slice(&balance.to_be_bytes::<32>());
+                        result.push(DiffEncoder::status_to_u8(status));
                     } else {
                         result.push(0u8); 
                     }
@@ -307,7 +307,7 @@ impl DiffEncoder {
                     if let Some((nonce, status)) = &account.nonce {
                         result.push(1u8); 
                         result.extend_from_slice(&nonce.to_be_bytes());
-                        result.push(self.status_to_u8(status));
+                        result.push(DiffEncoder::status_to_u8(status));
                     } else {
                         result.push(0u8); 
                     }
@@ -315,7 +315,7 @@ impl DiffEncoder {
                     if let Some((code_hash, status)) = &account.code_hash {
                         result.push(1u8); 
                         result.extend_from_slice(code_hash.as_slice());
-                        result.push(self.status_to_u8(status));
+                        result.push(DiffEncoder::status_to_u8(status));
                     } else {
                         result.push(0u8); 
                     }
@@ -377,7 +377,7 @@ impl DiffEncoder {
         if self.compression_level != CompressionLevel::None && result.len() > 1024 {
             let mut compressed = Vec::with_capacity(result.len());
             
-            compressed.extend_from_slice(&[0xC0, 0xDE, 0xC0, 0xMP]);
+            compressed.extend_from_slice(&[0xC0, 0xDE, 0xC0, 0xD0]);
             
             compressed.extend_from_slice(&(result.len() as u32).to_be_bytes());
             
@@ -430,8 +430,9 @@ impl DiffEncoder {
         
         frequent.sort_by(|a, b| b.1.cmp(&a.1));
         
+        let frequent_len = frequent.len();
         let top_addresses: Vec<Address> = frequent.into_iter()
-            .take(std::cmp::min(frequent.len(), u16::MAX as usize))
+            .take(std::cmp::min(frequent_len, u16::MAX as usize))
             .map(|(addr, _)| addr)
             .collect();
         
@@ -508,7 +509,7 @@ impl DiffEncoder {
         let mut addresses: Vec<(Address, usize)> = address_counts.into_iter().collect();
         addresses.sort_by(|a, b| b.1.cmp(&a.1)); 
         
-        let mut addre1ss_dict: HashMap<Address, u16, StdRandomState> =
+        let mut address_dict: HashMap<Address, u16, StdRandomState> =
             HashMap::with_hasher(StdRandomState::new());
         
         for (i, (address, _)) in addresses.iter().enumerate().take(u16::MAX as usize) {

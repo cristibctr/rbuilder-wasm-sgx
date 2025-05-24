@@ -1835,6 +1835,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-builder-types"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus 0.11.1",
+ "alloy-eips 0.11.1",
+ "alloy-primitives 0.8.23",
+ "alloy-rlp",
+ "hex",
+ "serde",
+]
+
+[[package]]
 name = "block-padding"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9367,6 +9379,7 @@ dependencies = [
  "atoi",
  "beacon-api-client",
  "bigdecimal 0.4.6",
+ "block-builder-types",
  "built",
  "clap 4.5.21",
  "criterion 0.5.1",
@@ -15894,8 +15907,12 @@ dependencies = [
 name = "wasm-block-builder"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus 0.11.1",
+ "alloy-eips 0.11.1",
  "alloy-primitives 0.8.23",
  "alloy-rlp",
+ "alloy-trie",
+ "block-builder-types",
  "ecdsa 0.16.9",
  "hashbrown 0.14.5",
  "hex",

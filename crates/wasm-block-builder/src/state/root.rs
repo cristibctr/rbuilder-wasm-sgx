@@ -5,6 +5,7 @@ use crate::state::WasiStateProvider;
 use hashbrown::{HashMap, HashSet};
 use std::collections::hash_map::RandomState as StdRandomState;
 use thiserror::Error;
+use crate::sgx_log;
 
 #[derive(Error, Debug)]
 pub enum StateRootError {
@@ -575,7 +576,10 @@ pub fn calculate_state_root(
     changes: &SerializedStateDiff, 
     state: &WasiStateProvider
 ) -> Result<B256, StateRootError> {
-    log::info!("Calculating state root with Merkle Patricia Trie");
+    let error_msg = format!("Calculating state root with Merkle Patricia Trie");
+    log::info!("{}", error_msg);
+    sgx_log(&error_msg);
+
     
     let mut trie = PatriciaTrie::new();
     

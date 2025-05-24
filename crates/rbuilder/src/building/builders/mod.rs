@@ -76,14 +76,18 @@ impl OrderConsumer {
     /// Call apply_new_commands to easily consume them.
     /// This method will block until the first command is received
     pub fn try_consume_next_commands(&mut self) -> eyre::Result<bool> {
-        let mut received_any = false;
-        
+        match self.orders.blocking_recv() {
+            Ok(order) => self.new_commands.push(order),
+            Err(RecvError::Closed) => {
+                return Ok(false);
+            }
+            Err(RecvError::Lagged(msg)) => {
+                warn!(msg, "Builder thread lagging on sim orders channel");
+            }
+        }
         for _ in 0..1024 {
             match self.orders.try_recv() {
-                Ok(order) => {
-                    self.new_commands.push(order);
-                    received_any = true;
-                }
+                Ok(order) => self.new_commands.push(order),
                 Err(TryRecvError::Empty) => {
                     break;
                 }

@@ -1,15 +1,10 @@
-use crate::{
-    evm,
-    evm::UsedStateTrace,
-    interfaces::{
-        input::{BlockBuilderConfig, BlockParams, SerializedTransaction, SerializedAccount, SerializedCode, SerializedStorage},
-        output::{SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, SerializedStorageDiff, SerializedCodeDiff, ChunkInfo},
-    },
-    state::{
-        WasiStateProvider, StateDiffCollector, StateDiffCollectorSettings, 
-        CompressionLevel, EnhancedStateDiff, diff::AccessType, DiffEncoder
-    },
-};
+use crate::{evm, evm::UsedStateTrace, interfaces::{
+    input::{BlockBuilderConfig, BlockParams, SerializedTransaction, SerializedAccount, SerializedCode, SerializedStorage},
+    output::{SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, SerializedStorageDiff, SerializedCodeDiff, ChunkInfo},
+}, sgx_log, state::{
+    WasiStateProvider, StateDiffCollector, StateDiffCollectorSettings,
+    CompressionLevel, EnhancedStateDiff, diff::AccessType, DiffEncoder
+}};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use hashbrown::{HashMap, HashSet};
 use std::collections::hash_map::RandomState as StdRandomState;
@@ -166,10 +161,26 @@ impl WasiSimulator {
                 .get(&ordered_tx.transaction.from)
                 .unwrap_or(&0);
                 
-            if ordered_tx.transaction.nonce != sender_nonce {
+            let tx_address = ordered_tx.transaction.from;
+            let slot0_nonce = if let Some(account_info) = state.account_info(tx_address) {
+                let slot_value = state.storage_value(tx_address, U256::ZERO.into());
+                if slot_value != B256::ZERO {
+                    Some(U256::from_be_bytes(slot_value.0).to::<u64>())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            
+            let effective_nonce = slot0_nonce.unwrap_or(sender_nonce);
+            
+            if ordered_tx.transaction.nonce != effective_nonce {
                 debug!(
-                    "Skipping transaction with incorrect nonce: expected {}, got {}",
+                    "Skipping transaction with incorrect nonce: expected {} (header: {}, slot0: {:?}), got {}",
+                    effective_nonce,
                     sender_nonce,
+                    slot0_nonce,
                     ordered_tx.transaction.nonce
                 );
                 continue;
@@ -184,7 +195,34 @@ impl WasiSimulator {
             ) {
                 Ok(result) => result,
                 Err(err) => {
-                    error!("Transaction execution failed: {:?}", err);
+                    let error_msg = format!("Transaction execution failed: {:?}, tx hash: {:?}, from: {:?}, to: {:?}, nonce: {}, gas: {}, gas_price: {:?}, value: {:?}", 
+                           err, 
+                           ordered_tx.transaction.hash,
+                           ordered_tx.transaction.from,
+                           ordered_tx.transaction.to,
+                           ordered_tx.transaction.nonce,
+                           ordered_tx.transaction.gas_limit,
+                           ordered_tx.transaction.gas_price,
+                           ordered_tx.transaction.value);
+                    log::error!("{}", error_msg);
+                    sgx_log(&error_msg);
+                    
+                    if let Some(account_info) = state.account_info(ordered_tx.transaction.from) {
+                        debug!("Sender account state: balance={:?}, nonce={}, code_hash={:?}", 
+                               account_info.balance, account_info.nonce, account_info.code_hash);
+                    } else {
+                        debug!("Sender account not found in state");
+                    }
+                    
+                    if let Some(to) = ordered_tx.transaction.to {
+                        if let Some(account_info) = state.account_info(to) {
+                            debug!("Recipient account state: balance={:?}, nonce={}, code_hash={:?}", 
+                                   account_info.balance, account_info.nonce, account_info.code_hash);
+                        } else {
+                            debug!("Recipient account not found in state");
+                        }
+                    }
+                    
                     if let Some(bundle_hash) = ordered_tx.bundle_hash {
                         bundle_failed.insert(bundle_hash);
                     }
@@ -265,6 +303,14 @@ impl WasiSimulator {
             accounts_to_check.insert(*address);
         }
         
+        for address in self.state_trace.read_nonces.keys() {
+            accounts_to_check.insert(*address);
+        }
+        
+        for address in self.state_trace.written_nonces.keys() {
+            accounts_to_check.insert(*address);
+        }
+        
         for slot_key in self.state_trace.read_slots.keys() {
             accounts_to_check.insert(slot_key.address);
         }
@@ -298,13 +344,33 @@ impl WasiSimulator {
         for address in accounts_to_check {
             if let Some(account_info) = state.account_info(address) {
                 let old_balance = self.state_trace.read_balances.get(&address).cloned();
+                let old_nonce = self.state_trace.read_nonces.get(&address).cloned();
+                
+                let old_nonce = self.state_trace.read_nonces.get(&address).cloned();
+                let new_nonce = if account_info.nonce == old_nonce.unwrap_or(0)
+                    && self.state_trace
+                        .written_slots
+                        .get(&SlotKey { address, key: U256::ZERO.into() })
+                        .is_some()
+                {
+                    Some(
+                        U256::from_be_bytes(
+                            self.state_trace
+                                .written_slots[&SlotKey { address, key: U256::ZERO.into() }].0
+                        ).to::<u64>()
+                    )
+                } else if self.state_trace.written_nonces.contains_key(&address) {
+                    Some(self.state_trace.written_nonces[&address])
+                } else {
+                    Some(account_info.nonce)
+                };
                 
                 let account_diff = SerializedAccountDiff {
                     address,
                     old_balance,
                     new_balance: Some(account_info.balance),
-                    old_nonce: None,
-                    new_nonce: Some(account_info.nonce),
+                    old_nonce,
+                    new_nonce,
                     old_code_hash: None,
                     new_code_hash: Some(account_info.code_hash),
                 };
@@ -332,7 +398,7 @@ impl WasiSimulator {
                 if let Some(collector) = &mut collector {
                     if self.state_trace.created_contracts.contains(&address) {
                         collector.record_account_create(&address, &revm::primitives::CreateScheme::Create, account_info);
-                    } else if self.state_trace.read_balances.contains_key(&address) {
+                    } else if self.state_trace.read_balances.contains_key(&address) || self.state_trace.read_nonces.contains_key(&address) {
                         collector.record_account_update(&address, account_info);
                     }
                 }
