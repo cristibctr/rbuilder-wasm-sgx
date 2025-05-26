@@ -29,4 +29,3 @@ pub struct StateProviderInput {
     
     pub code: Vec<SerializedCode>,
 }
-

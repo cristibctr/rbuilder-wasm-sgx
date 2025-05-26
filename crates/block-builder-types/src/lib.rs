@@ -156,7 +156,7 @@ impl SerializedAccount {
     pub fn is_contract(&self) -> bool {
         self.code_hash != alloy_consensus::constants::KECCAK_EMPTY
     }
-    
+
     pub fn is_empty(&self) -> bool {
         self.balance.is_zero() && self.nonce == 0 && self.code_hash == alloy_consensus::constants::KECCAK_EMPTY
     }
@@ -199,19 +199,19 @@ impl SerializedTransaction {
     pub fn is_eip1559(&self) -> bool {
         matches!(self.tx_type, TxType::Eip1559 | TxType::Eip4844 | TxType::Eip7702)
     }
-    
+
     pub fn is_blob_tx(&self) -> bool {
         self.tx_type == TxType::Eip4844
     }
-    
+
     pub fn is_eip7702(&self) -> bool {
         self.tx_type == TxType::Eip7702
     }
-    
+
     pub fn is_create(&self) -> bool {
         self.to.is_none()
     }
-    
+
     pub fn effective_gas_price(&self, base_fee: U256) -> U256 {
         if let Some(gas_price) = self.gas_price {
             gas_price
@@ -258,4 +258,71 @@ pub enum SortingAlgorithm {
     GasPrice,
     Profit,
     MevGasPrice,
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    Legacy,
+    OrderingOnlyMode,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        ExecutionMode::OrderingOnlyMode
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderingInput {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub base_fee: U256,
+    pub gas_limit: u64,
+    pub orders: Vec<OrderForOrdering>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderForOrdering {
+    pub id: String,
+    pub order_type: String,
+    pub coinbase_profit: U256,
+    pub gas_used: u64,
+    pub gas_price: U256,
+    pub order_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SgxOrderingInput {
+    pub block_number: u64,
+    pub block_timestamp: u64,
+    pub base_fee: U256,
+    pub gas_limit: u64,
+    pub orders: Vec<OrderForOrdering>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SgxOrderingResult {
+    pub ordered_transaction_ids: Vec<String>,
+    pub ordered_transactions: Vec<OrderedTransaction>,
+    pub block_number: u64,
+    pub timestamp: u64,
+    pub sgx_signature: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SgxOrderingOutput {
+    pub ordered_transaction_ids: Vec<String>,
+    pub block_number: u64,
+    pub timestamp: u64,
+    pub signature: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderedTransaction {
+    pub id: String,
+    pub order_type: String,
+    pub encoded_signed_tx: Bytes,
+    pub order_id: String,
+    pub order_hash: String,
 }

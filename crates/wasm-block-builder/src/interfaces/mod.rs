@@ -7,6 +7,7 @@ pub use input::{
     BlockBuilderConfig, BlockBuilderInput, BlockParams, SerializedAccount, SerializedBundle,
     SerializedCode, SerializedStorage, SerializedTransaction, StateProviderInput,
 };
+pub use block_builder_types::{OrderingInput, OrderForOrdering, SgxOrderingOutput};
 pub use block_builder_types::{
     AccountDiff, BlockBuilderOutput, BlockMetrics, SerializedBuildTrace, SerializedLog,
     SerializedReceipt, SerializedStateDiff, SerializedAccountDiff, StorageDiff, SerializedStorageDiff,
@@ -96,6 +97,24 @@ pub fn serialize_output_without_signature(output: &BlockBuilderOutput) -> Result
 
     serialize_json(&output_clone).map_err(|e| WasiError::OutputSerialization(
         format!("Failed to serialize BlockBuilderOutput for signing: {}", e)
+    ))
+}
+
+
+pub fn deserialize_ordering_input(data: &[u8]) -> Result<OrderingInput, WasiError> {
+    deserialize_json(data).map_err(WasiError::from)
+}
+
+pub fn serialize_ordering_output(output: SgxOrderingOutput) -> Result<Vec<u8>, WasiError> {
+    serialize_json(&output).map_err(|e| WasiError::OutputSerialization(e.to_string()))
+}
+
+pub fn serialize_ordering_output_without_signature(output: &SgxOrderingOutput) -> Result<Vec<u8>, WasiError> {
+    let mut output_clone = output.clone();
+    output_clone.signature = None;
+
+    serialize_json(&output_clone).map_err(|e| WasiError::OutputSerialization(
+        format!("Failed to serialize SgxOrderingOutput for signing: {}", e)
     ))
 }
 

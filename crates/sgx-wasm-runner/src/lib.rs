@@ -1474,6 +1474,176 @@ impl BlockBuilderSgx {
         Ok(output_str)
     }
     
+    pub fn order_transactions(&self, input_json: &str) -> Result<String, Error> {
+        const INPUT_CHUNK_SIZE: usize = 64 * 1024; 
+        
+        let mut attempt = 0;
+        let max_attempts = 1; 
+        let mut input_ptr = 0u32;
+        
+        let max_single_alloc = 256 * 1024; 
+        let alloc_size = std::cmp::min(input_json.len(), max_single_alloc);
+
+        debug!("[SGX Memory] Allocating memory for ordering input: {} bytes (input size: {} bytes)", 
+                 alloc_size, input_json.len());
+        
+        while attempt < max_attempts {
+            attempt += 1;
+            let alloc_args = vec![Value::I32(alloc_size as i32)];
+            match self.module.call_function("wbm_alloc", &alloc_args) {
+                Ok(result) => {
+                    match &result[0] {
+                        Value::I32(ptr) => {
+                            input_ptr = *ptr as u32;
+                            debug!("[SGX Memory] Successfully allocated {} bytes at ptr {}", alloc_size, input_ptr);
+                            break;
+                        },
+                        _ => {
+                            if attempt == max_attempts {
+                                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc".to_string()));
+                            }
+                            debug!("[SGX Memory] Invalid pointer type returned, retrying in {}ms", 200 * attempt);
+                            std::thread::sleep(std::time::Duration::from_millis(200 * attempt as u64));
+                        }
+                    }
+                },
+                Err(e) => {
+                    error!("[SGX Error] Failed to allocate memory for ordering input after {} attempts: {}", attempt, e);
+                }
+            }
+        }
+        
+        for chunk_start in (0..input_json.len()).step_by(INPUT_CHUNK_SIZE).enumerate() {
+            let chunk_end = std::cmp::min(chunk_start.1 + INPUT_CHUNK_SIZE, input_json.len());
+            let chunk = &input_json.as_bytes()[chunk_start.1..chunk_end];
+            let target_offset = input_ptr + chunk_start.1 as u32;
+            
+            let mut write_attempt = 0;
+            let max_write_attempts = 3;
+            let mut write_success = false;
+            
+            while write_attempt < max_write_attempts && !write_success {
+                write_attempt += 1;
+                match self.module.write_memory(target_offset, chunk) {
+                    Ok(_) => {
+                        write_success = true;
+                        debug!("[SGX Memory] Successfully wrote chunk {} ({} bytes) at offset {}", chunk_start.0, chunk.len(), target_offset);
+                    },
+                    Err(e) => {
+                        debug!("[SGX Memory] Failed to write chunk {}, attempt {} of {}: {}", chunk_start.0, write_attempt, max_write_attempts, e);
+                        if write_attempt < max_write_attempts {
+                            std::thread::sleep(std::time::Duration::from_millis(100 * write_attempt as u64));
+                        }
+                    }
+                }
+            }
+            
+            if !write_success {
+                let free_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_args);
+                return Err(Error::InvalidArgument(format!("Failed to write chunk {} after {} attempts", chunk_start.0, max_write_attempts)));
+            }
+        }
+        
+        let output_size = 1024 * 1024; 
+        let output_alloc_args = vec![Value::I32(output_size as i32)];
+        let output_alloc_result = self.module.call_function("wbm_alloc", &output_alloc_args)?;
+        
+        let output_ptr = match &output_alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => {
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc for output".to_string()));
+            }
+        };
+        
+        let len_alloc_args = vec![Value::I32(4)];
+        let len_alloc_result = self.module.call_function("wbm_alloc", &len_alloc_args)?;
+        
+        let len_ptr = match &len_alloc_result[0] {
+            Value::I32(ptr) => *ptr as u32,
+            _ => {
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                return Err(Error::InvalidArgument("Invalid pointer returned from wbm_alloc for length".to_string()));
+            }
+        };
+        
+        self.module.write_memory(len_ptr, &(output_size as u32).to_le_bytes())?;
+        
+        let order_args = vec![
+            Value::I32(input_ptr as i32),
+            Value::I32(input_json.len() as i32),
+            Value::I32(output_ptr as i32),
+            Value::I32(len_ptr as i32),
+        ];
+        
+        debug!("[SGX Call] Calling order_transactions with input_ptr={}, input_len={}, output_ptr={}, len_ptr={}", 
+               input_ptr, input_json.len(), output_ptr, len_ptr);
+        
+        let order_result = match self.module.call_function("order_transactions", &order_args) {
+            Ok(result) => result,
+            Err(e) => {
+                error!("[SGX Error] order_transactions function call failed: {}", e);
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(Error::InvalidArgument(format!("order_transactions call failed: {}", e)));
+            }
+        };
+        
+        let result_code = match &order_result[0] {
+            Value::I32(code) => *code,
+            _ => {
+                let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+                let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+                let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+                let _ = self.module.call_function("wbm_free", &free_input_args);
+                let _ = self.module.call_function("wbm_free", &free_output_args);
+                let _ = self.module.call_function("wbm_free", &free_len_args);
+                return Err(Error::InvalidArgument("Invalid result code from order_transactions".to_string()));
+            }
+        };
+        
+        if result_code != 0 {
+            let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+            let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+            let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+            let _ = self.module.call_function("wbm_free", &free_input_args);
+            let _ = self.module.call_function("wbm_free", &free_output_args);
+            let _ = self.module.call_function("wbm_free", &free_len_args);
+            return Err(Error::InvalidArgument(format!("order_transactions failed with code: {}", result_code)));
+        }
+        
+        let len_data = self.module.read_memory(len_ptr, 4)?;
+        let output_len = u32::from_le_bytes([len_data[0], len_data[1], len_data[2], len_data[3]]) as usize;
+        
+        debug!("[SGX Memory] Reading ordering output: {} bytes from ptr {}", output_len, output_ptr);
+        
+        let output_data = self.module.read_memory(output_ptr, output_len as u32)?;
+        
+        let free_input_args = vec![Value::I32(input_ptr as i32), Value::I32(alloc_size as i32)];
+        let free_output_args = vec![Value::I32(output_ptr as i32), Value::I32(output_size as i32)];
+        let free_len_args = vec![Value::I32(len_ptr as i32), Value::I32(4)];
+        let _ = self.module.call_function("wbm_free", &free_input_args);
+        let _ = self.module.call_function("wbm_free", &free_output_args);
+        let _ = self.module.call_function("wbm_free", &free_len_args);
+        
+        let output_str = match String::from_utf8(output_data) {
+            Ok(str) => str,
+            Err(_) => return Err(Error::InvalidArgument("Ordering output is not valid UTF-8".to_string())),
+        };
+        
+        debug!("[SGX Success] order_transactions completed successfully, output length: {}", output_str.len());
+        Ok(output_str)
+    }
+    
     pub fn get_module_info(&self) -> Result<String, Error> {
         
         let output_size = 4096;

@@ -5,7 +5,8 @@ mod evm;
 mod interfaces;
 mod state;
 
-use interfaces::{deserialize_block_input, deserialize_state_input, deserialize_state_changes, serialize_output};
+use interfaces::{deserialize_block_input, deserialize_state_input, deserialize_state_changes, serialize_output, deserialize_ordering_input, serialize_ordering_output, serialize_ordering_output_without_signature};
+use block_builder_types;
 use state::provider::WasiStateProvider;
 use thiserror::Error;
 use std::sync::{Arc, Mutex, Once};
@@ -136,6 +137,180 @@ fn process_build_block_safe(
     Ok(())
 }
 
+#[no_mangle]
+pub extern "C" fn order_transactions(
+    input_ptr: *const u8, 
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_len_ptr: *mut usize
+) -> i32 {
+    match process_order_transactions_safe(input_ptr, input_len, output_ptr, output_len_ptr) {
+        Ok(_) => 0,
+        Err(e) => {
+            let error_msg = format!("order_transactions failed: {}", e);
+            log::error!("{}", error_msg);
+            sgx_log(&error_msg);
+            
+            match e {
+                WasiError::NullInputPtr => -1,
+                WasiError::NullOutputPtr => -1,
+                WasiError::OutputBufferTooSmall { .. } => -2,
+                WasiError::InputDeserialization(_) => -3,
+                WasiError::Builder(_) => -4,
+                WasiError::Evm(_) => -5,
+                WasiError::State(_) => -6,
+                WasiError::StateRoot(_) => -7,
+                WasiError::OutputSerialization(_) => -8,
+                WasiError::Crypto(_) => -9,
+            }
+        }
+    }
+}
+
+fn process_order_transactions_safe(
+    input_ptr: *const u8, 
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_len_ptr: *mut usize
+) -> WasiResult<()> {
+    if input_ptr.is_null() { return Err(WasiError::NullInputPtr); }
+    if output_ptr.is_null() || output_len_ptr.is_null() { return Err(WasiError::NullOutputPtr); }
+
+    let input_slice = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    
+    let output_vec = process_order_transactions_internal(input_slice)?;
+    
+    unsafe {
+        let provided_len = *output_len_ptr;
+        let required_len = output_vec.len();
+        
+        if required_len > provided_len {
+            *output_len_ptr = required_len;
+            return Err(WasiError::OutputBufferTooSmall { required: required_len, provided: provided_len });
+        }
+        
+        std::ptr::copy_nonoverlapping(output_vec.as_ptr(), output_ptr, required_len);
+        *output_len_ptr = required_len;
+    }
+    
+    Ok(())
+}
+
+fn process_order_transactions_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
+    let input_data = deserialize_ordering_input(input)
+        .map_err(|e| WasiError::InputDeserialization(format!("Failed to deserialize OrderingInput: {}", e)))?;
+    
+    let log_message = format!("Starting transaction ordering for block {}", input_data.block_number);
+    log::info!("{}", log_message);
+    sgx_log(&log_message);
+    
+    let state_provider = WasiStateProvider::new(
+        Vec::new(), 
+        Vec::new(), 
+        Vec::new(), 
+    );
+    
+    let block_params = interfaces::input::BlockParams {
+        number: input_data.block_number,
+        timestamp: input_data.block_timestamp,
+        gas_limit: input_data.gas_limit,
+        base_fee_per_gas: input_data.base_fee,
+        coinbase: alloy_primitives::Address::ZERO,
+        parent_hash: alloy_primitives::B256::ZERO,
+        parent_state_root: alloy_primitives::B256::ZERO,
+        withdrawals_root: None,
+        blob_gas_used: None,
+        excess_blob_gas: None,
+        parent_beacon_block_root: None,
+        prev_randao: alloy_primitives::B256::ZERO,
+    };
+    
+    let transactions: Vec<interfaces::input::SerializedTransaction> = input_data.orders
+        .iter()
+        .filter(|order| order.order_type == "transaction")
+        .map(|order| interfaces::input::SerializedTransaction {
+            hash: {
+                let decoded = hex::decode(&order.order_hash).unwrap_or_else(|_| vec![0u8; 32]);
+                if decoded.len() >= 32 {
+                    alloy_primitives::B256::from_slice(&decoded[..32])
+                } else {
+                    alloy_primitives::B256::ZERO
+                }
+            },
+            from: alloy_primitives::Address::ZERO, 
+            to: None,
+            value: alloy_primitives::U256::ZERO,
+            gas_limit: order.gas_used,
+            gas_price: Some(order.gas_price),
+            nonce: 0,
+            input: alloy_primitives::Bytes::default(),
+            tx_type: alloy_consensus::TxType::Legacy,
+            access_list: Vec::new(),
+            blob_hashes: Vec::new(),
+            max_priority_fee_per_gas: Some(order.gas_price),
+            max_fee_per_gas: Some(order.gas_price),
+            max_fee_per_blob_gas: None,
+            versioned_hashes: Vec::new(),
+            encoded_signed_tx: alloy_primitives::Bytes::default(),
+        })
+        .collect();
+    
+    let bundles: Vec<interfaces::input::SerializedBundle> = input_data.orders
+        .iter()
+        .filter(|order| order.order_type == "bundle" || order.order_type == "share_bundle")
+        .map(|order| interfaces::input::SerializedBundle {
+            id: order.id.clone(),
+            transactions: vec![], 
+            hash: {
+                let decoded = hex::decode(&order.order_hash).unwrap_or_else(|_| vec![0u8; 32]);
+                if decoded.len() >= 32 {
+                    alloy_primitives::B256::from_slice(&decoded[..32])
+                } else {
+                    alloy_primitives::B256::ZERO
+                }
+            },
+            revertible: false, 
+        })
+        .collect();
+    
+    let sorter = builder::ordering::WasiOrderSorter::new(block_builder_types::SortingAlgorithm::MevGasPrice)
+        .with_block_params(block_params);
+    
+    let mut state_copy = state_provider;
+    let ordered_transactions = sorter.sort_transactions(transactions, bundles, &mut state_copy)?;
+    
+    let ordered_ids: Vec<String> = input_data.orders
+        .iter()
+        .map(|order| order.id.clone())  
+        .collect();
+    
+    let mut output_data = block_builder_types::SgxOrderingOutput {
+        ordered_transaction_ids: ordered_ids,
+        block_number: input_data.block_number,
+        timestamp: input_data.block_timestamp,
+        signature: None,
+    };
+    
+    let log_message = format!("Completed ordering {} transactions", ordered_transactions.len());
+    log::info!("{}", log_message);
+    sgx_log(&log_message);
+    
+    let sign_message = format!("Signing transaction ordering for block {}", output_data.block_number);
+    log::info!("{}", sign_message);
+    sgx_log(&sign_message);
+
+    let signer = crypto::BlockSigner::new()?;
+    let data_to_sign = serialize_ordering_output_without_signature(&output_data)?;
+    let signature = signer.sign(&data_to_sign)?;
+    output_data.signature = Some(signature);
+    
+    let finish_message = format!("Finished transaction ordering for block {} with signature", output_data.block_number);
+    log::info!("{}", finish_message);
+    sgx_log(&finish_message);
+    
+    serialize_ordering_output(output_data)
+        .map_err(|e| WasiError::OutputSerialization(format!("Failed to serialize ordering output: {}", e)))
+}
 
 fn process_build_block_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
     let input_data = deserialize_block_input(input)

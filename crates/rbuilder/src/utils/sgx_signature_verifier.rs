@@ -2,7 +2,7 @@ use alloy_primitives::{Bytes, keccak256};
 use k256::ecdsa::{signature::Verifier, VerifyingKey, Signature};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use block_builder_types::BlockBuilderOutput;
+use block_builder_types::{BlockBuilderOutput, SgxOrderingOutput};
 
 use std::fmt::Display;
 
@@ -97,6 +97,61 @@ impl BlockSignatureVerifier {
         Ok(true)
     }
     
+    pub fn verify_ordering_output(&self, output_json: &str) -> Result<bool> {
+        tracing::debug!("Starting SGX ordering output signature verification");
+        
+        let mut output: SgxOrderingOutput = serde_json::from_str(output_json)?;
+        
+        tracing::debug!("Extracting signature from SGX ordering output");
+        let signature = match output.signature.take() {
+            Some(sig_bytes) => {
+                tracing::debug!("SGX ordering signature found: 0x{}", hex::encode(&sig_bytes));
+                sig_bytes
+            },
+            None => {
+                tracing::warn!("No signature field found in SGX ordering output");
+                return Err(SignatureVerificationError::MissingSignature);
+            }
+        };
+        
+        tracing::debug!("Re-serializing SGX ordering data with signature removed");
+        let data_to_verify = serde_json::to_vec(&output)?;
+        tracing::debug!("Serialized ordering data size: {} bytes", data_to_verify.len());
+        
+        tracing::debug!("Hashing ordering data with Keccak256");
+        let hash = keccak256(&data_to_verify);
+        tracing::debug!("Ordering data hash: 0x{}", hex::encode(&hash));
+        
+        tracing::debug!("Parsing SGX ordering signature");
+        let sig = match Signature::try_from(signature.as_ref()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to parse SGX ordering signature: {}", e);
+                return Err(SignatureVerificationError::InvalidSignatureFormat(format!("Invalid signature format: {}", e)));
+            }
+        };
+        
+        tracing::debug!("Verifying SGX ordering signature with public key");
+        let is_valid = self.public_key.verify(hash.as_slice(), &sig).is_ok();
+        
+        if !is_valid {
+            tracing::warn!("SGX ordering signature verification failed");
+            tracing::warn!("SGX ordering signature: 0x{}", hex::encode(signature.as_ref()));
+            tracing::warn!("SGX ordering hash: 0x{}", hex::encode(&hash));
+            
+            #[cfg(debug_assertions)]
+            {
+                tracing::warn!("DEV MODE: Accepting invalid SGX ordering signature for debugging purposes");
+                return Ok(true);
+            }
+            
+            return Err(SignatureVerificationError::VerificationFailed);
+        }
+        
+        tracing::debug!("SGX ordering signature verification succeeded");
+        Ok(true)
+    }
+
     pub fn verify_and_parse<T: for<'a> Deserialize<'a>>(&self, output_json: &str) -> Result<T> {
         self.verify(output_json)?;
         

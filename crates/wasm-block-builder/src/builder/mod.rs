@@ -1,4 +1,4 @@
-mod ordering;
+pub mod ordering;
 mod simulator;
 
 use crate::{interfaces::{

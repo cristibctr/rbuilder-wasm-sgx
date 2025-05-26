@@ -81,11 +81,18 @@ pub struct SgxWasmBuilderConfig {
     pub wasm_path: PathBuf,
     #[serde(default = "default_fallback_to_native")]
     pub fallback_to_native: bool,
+    #[serde(default = "default_execution_mode")]
+    pub execution_mode: block_builder_types::ExecutionMode,
 }
 
 #[cfg(feature = "sgx_integration")]
 fn default_fallback_to_native() -> bool {
-    true
+    false
+}
+
+#[cfg(feature = "sgx_integration")]
+fn default_execution_mode() -> block_builder_types::ExecutionMode {
+    block_builder_types::ExecutionMode::Legacy
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -574,7 +581,8 @@ impl Default for Config {
                 name: String::from("sgx-wasm"),
                 builder: SpecificBuilderConfig::SgxWasmBuilder(SgxWasmBuilderConfig {
                     wasm_path,
-                    fallback_to_native: true,
+                    fallback_to_native: false,
+                    execution_mode: block_builder_types::ExecutionMode::OrderingOnlyMode,
                 }),
             });
         }
@@ -673,7 +681,7 @@ where
         SpecificBuilderConfig::SgxWasmBuilder(sgx_cfg) => {
             use crate::building::builders::sgx_wasm_builder::SgxWasmBlockBuildingAlgorithm;
             
-            match SgxWasmBlockBuildingAlgorithm::new(sgx_cfg.wasm_path.clone(), sgx_cfg.fallback_to_native) {
+            match SgxWasmBlockBuildingAlgorithm::new_with_execution_mode(sgx_cfg.wasm_path.clone(), sgx_cfg.fallback_to_native, sgx_cfg.execution_mode.clone()) {
                 Ok(builder) => {
                     info!("SGX WASM block builder initialized successfully");
                     Arc::new(builder)
@@ -695,13 +703,15 @@ where
                             format!("{}-fallback", cfg.name),
                         ))
                     } else {
-                        let builder = SgxWasmBlockBuildingAlgorithm::new(
+                        let builder = SgxWasmBlockBuildingAlgorithm::new_with_execution_mode(
                             sgx_cfg.wasm_path,
                             false,
+                            sgx_cfg.execution_mode.clone(),
                         ).unwrap_or_else(|_| {
-                            SgxWasmBlockBuildingAlgorithm::new(
+                            SgxWasmBlockBuildingAlgorithm::new_with_execution_mode(
                                 PathBuf::from("/nonexistent"),
                                 false,
+                                sgx_cfg.execution_mode.clone(),
                             ).expect("This should never fail")
                         });
                         Arc::new(builder)

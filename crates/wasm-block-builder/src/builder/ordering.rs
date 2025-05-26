@@ -1,8 +1,9 @@
 use crate::{
     evm,
-    interfaces::input::{BlockParams, SerializedBundle, SerializedTransaction, SortingAlgorithm},
+    interfaces::input::{BlockParams, SerializedBundle, SerializedTransaction},
     state::WasiStateProvider,
 };
+use block_builder_types::SortingAlgorithm;
 use alloy_primitives::{Address, B256, U256};
 use super::BlockBuilderError;
 use log::{debug, info};
