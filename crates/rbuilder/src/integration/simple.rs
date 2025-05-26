@@ -61,7 +61,7 @@ mod tests {
         // Wait for receipt
         let binding = ProviderBuilder::new().on_http(Url::parse(srv.el_url()).unwrap());
         let pending_tx = PendingTransactionBuilder::new(binding.root().clone(), tx_hash)
-            .with_timeout(Some(std::time::Duration::from_secs(120)));
+            .with_timeout(Some(std::time::Duration::from_secs(60)));
 
         let receipt = pending_tx.get_receipt().await.unwrap();
         srv.validate_block_built(receipt.block_number.unwrap())
@@ -80,7 +80,7 @@ mod tests {
 
             // wait for 20 seconds
             let pending_tx = PendingTransactionBuilder::new(binding.root().clone(), tx_hash)
-                .with_timeout(Some(std::time::Duration::from_secs(200)));
+                .with_timeout(Some(std::time::Duration::from_secs(20)));
 
             assert!(
                 pending_tx.get_receipt().await.is_err(),
@@ -98,7 +98,7 @@ mod tests {
 
             // wait for 20 seconds
             let pending_tx = PendingTransactionBuilder::new(binding.root().clone(), tx_hash)
-                .with_timeout(Some(std::time::Duration::from_secs(200)));
+                .with_timeout(Some(std::time::Duration::from_secs(20)));
 
             assert!(
                 pending_tx.get_receipt().await.is_err(),

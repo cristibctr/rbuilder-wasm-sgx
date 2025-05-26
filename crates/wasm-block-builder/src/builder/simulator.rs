@@ -267,11 +267,16 @@ impl WasiSimulator {
             }
             
             let receipt = SerializedReceipt {
-                tx_type: ordered_tx.transaction.tx_type as u8,
+                tx_type: match ordered_tx.transaction.tx_type {
+                    alloy_consensus::TxType::Legacy => reth_primitives::TxType::Legacy,
+                    alloy_consensus::TxType::Eip2930 => reth_primitives::TxType::Eip2930,
+                    alloy_consensus::TxType::Eip1559 => reth_primitives::TxType::Eip1559,
+                    alloy_consensus::TxType::Eip4844 => reth_primitives::TxType::Eip4844,
+                    alloy_consensus::TxType::Eip7702 => reth_primitives::TxType::Eip7702,
+                },
                 success: result.success,
                 cumulative_gas_used: current_gas_used,
                 logs: Vec::new(),
-                logs_bloom: [0u8; 256],
             };
             
             included_txs.push(ordered_tx.transaction);

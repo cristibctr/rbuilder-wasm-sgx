@@ -58,6 +58,7 @@ struct BlockParams {
     blob_gas_used: Option<u64>,
     excess_blob_gas: Option<u64>,
     parent_beacon_block_root: Option<B256>,
+    prev_randao: B256,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +355,7 @@ impl SgxWasmBacktestAdapter {
             blob_gas_used: None,
             excess_blob_gas: None,
             parent_beacon_block_root: None,
+            prev_randao: input.ctx.attributes.prev_randao,
         };
         let mut accounts = Vec::new();
         let mut storage = Vec::new();

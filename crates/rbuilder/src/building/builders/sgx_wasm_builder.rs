@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn, error, debug, trace};
 use tokio::sync::oneshot;
 use std::hash::Hash;
-use alloy_consensus::{Transaction, TxType, EMPTY_ROOT_HASH, Header as AlloyHeader};
+use alloy_consensus::{Transaction, TxType, EMPTY_ROOT_HASH, EMPTY_OMMER_ROOT_HASH, Header};
 use alloy_eips::merge::BEACON_NONCE;
 use alloy_eips::eip4895::Withdrawal;
 use reth_node_api::{FullNodeComponents, FullNodeTypes, PayloadBuilderAttributes};
@@ -20,11 +20,10 @@ use reth_errors::ProviderError;
 use reth_transaction_pool::PoolTransaction;
 use reth_primitives_traits::{SignedTransaction, Account};
 use reth_primitives::{
-    TransactionSigned, Header as RethHeader, Receipt as RethReceipt, Log as RethLog, LogData,
+    TransactionSigned, Receipt as RethReceipt, Log as RethLog, LogData,
 };
 use alloy_primitives::Bloom;
 use crate::building::{Address as RethAddress, Bytes as RethBytes, B256 as RethB256, U256 as RethU256};
-use crate::building::proofs;
 const EMPTY_CODE_HASH: B256 = KECCAK_EMPTY;
 const EMPTY_TRIE_ROOT: B256 = EMPTY_ROOT_HASH;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
@@ -139,7 +138,7 @@ struct SgxWasmBlockBuildingHelper {
     receipts: Vec<RethReceipt>,
     blob_sidecars: Vec<Arc<alloy_eips::eip4844::BlobTransactionSidecar>>,
     execution_requests: Vec<alloy_primitives::Bytes>,
-    sgx_output_header: AlloyHeader,
+    sgx_output_header: Header,
     sgx_state_diff: SerializedStateDiff,
 }
 
@@ -152,7 +151,7 @@ impl SgxWasmBlockBuildingHelper {
         receipts: Vec<RethReceipt>,
         blob_sidecars: Vec<Arc<alloy_eips::eip4844::BlobTransactionSidecar>>,
         execution_requests: Vec<alloy_primitives::Bytes>,
-        sgx_output_header: AlloyHeader,
+        sgx_output_header: Header,
         sgx_state_diff: SerializedStateDiff,
         block_trace: BuiltBlockTrace,
     ) -> Self {
@@ -234,13 +233,17 @@ impl block_building_helper::BlockBuildingHelper for SgxWasmBlockBuildingHelper {
 
         let header = self.sgx_output_header.clone();
         
+        debug!("[SGX DEBUG] SGX Header fields: parent_hash={:?}, number={}, timestamp={}, gas_limit={}, gas_used={}, base_fee_per_gas={:?}, beneficiary={:?}, state_root={:?}, transactions_root={:?}, receipts_root={:?}, mix_hash={:?}, withdrawals_root={:?}, blob_gas_used={:?}, excess_blob_gas={:?}",
+            header.parent_hash, header.number, header.timestamp, header.gas_limit, header.gas_used, header.base_fee_per_gas, header.beneficiary, header.state_root, header.transactions_root, header.receipts_root, header.mix_hash, header.withdrawals_root, header.blob_gas_used, header.excess_blob_gas);
+        debug!("[SGX DEBUG] Context prev_randao={:?}", ctx.attributes.prev_randao);
+        
         self.block_trace.root_hash_time = Duration::from_millis(0);
         
         let reth_transactions: Vec<TransactionSigned> = self.executed_txs.iter()
             .map(|tx| tx.internal_tx_unsecure().tx().clone())
             .collect();
 
-        let withdrawals = if ctx.chain_spec.is_shanghai_active_at_timestamp(ctx.attributes.timestamp) {
+        let withdrawals = if ctx.chain_spec.is_shanghai_active_at_timestamp(header.timestamp) {
             Some(ctx.attributes.withdrawals.clone())
         } else {
             None
@@ -254,7 +257,38 @@ impl block_building_helper::BlockBuildingHelper for SgxWasmBlockBuildingHelper {
         
         let block_with_senders = reth::primitives::Block { header: header.clone(), body };
         
+        let block_header = &block_with_senders.header;
+        debug!("[SGX DEBUG] === HEADER COMPARISON ===");
+        debug!("[SGX DEBUG] SGX parent_hash: {:?} vs Block parent_hash: {:?}", header.parent_hash, block_header.parent_hash);
+        debug!("[SGX DEBUG] SGX ommers_hash: {:?} vs Block ommers_hash: {:?}", header.ommers_hash, block_header.ommers_hash);
+        debug!("[SGX DEBUG] SGX beneficiary: {:?} vs Block beneficiary: {:?}", header.beneficiary, block_header.beneficiary);
+        debug!("[SGX DEBUG] SGX state_root: {:?} vs Block state_root: {:?}", header.state_root, block_header.state_root);
+        debug!("[SGX DEBUG] SGX transactions_root: {:?} vs Block transactions_root: {:?}", header.transactions_root, block_header.transactions_root);
+        debug!("[SGX DEBUG] SGX receipts_root: {:?} vs Block receipts_root: {:?}", header.receipts_root, block_header.receipts_root);
+        debug!("[SGX DEBUG] SGX logs_bloom: {:?} vs Block logs_bloom: {:?}", header.logs_bloom, block_header.logs_bloom);
+        debug!("[SGX DEBUG] SGX difficulty: {:?} vs Block difficulty: {:?}", header.difficulty, block_header.difficulty);
+        debug!("[SGX DEBUG] SGX number: {:?} vs Block number: {:?}", header.number, block_header.number);
+        debug!("[SGX DEBUG] SGX gas_limit: {:?} vs Block gas_limit: {:?}", header.gas_limit, block_header.gas_limit);
+        debug!("[SGX DEBUG] SGX gas_used: {:?} vs Block gas_used: {:?}", header.gas_used, block_header.gas_used);
+        debug!("[SGX DEBUG] SGX timestamp: {:?} vs Block timestamp: {:?}", header.timestamp, block_header.timestamp);
+        debug!("[SGX DEBUG] SGX extra_data: {:?} vs Block extra_data: {:?}", header.extra_data, block_header.extra_data);
+        debug!("[SGX DEBUG] SGX mix_hash: {:?} vs Block mix_hash: {:?}", header.mix_hash, block_header.mix_hash);
+        debug!("[SGX DEBUG] SGX nonce: {:?} vs Block nonce: {:?}", header.nonce, block_header.nonce);
+        debug!("[SGX DEBUG] SGX base_fee_per_gas: {:?} vs Block base_fee_per_gas: {:?}", header.base_fee_per_gas, block_header.base_fee_per_gas);
+        debug!("[SGX DEBUG] SGX withdrawals_root: {:?} vs Block withdrawals_root: {:?}", header.withdrawals_root, block_header.withdrawals_root);
+        debug!("[SGX DEBUG] SGX blob_gas_used: {:?} vs Block blob_gas_used: {:?}", header.blob_gas_used, block_header.blob_gas_used);
+        debug!("[SGX DEBUG] SGX excess_blob_gas: {:?} vs Block excess_blob_gas: {:?}", header.excess_blob_gas, block_header.excess_blob_gas);
+        debug!("[SGX DEBUG] SGX parent_beacon_block_root: {:?} vs Block parent_beacon_block_root: {:?}", header.parent_beacon_block_root, block_header.parent_beacon_block_root);
+        debug!("[SGX DEBUG] === END COMPARISON ===");
+
+        let sgx_hash = header.hash_slow();
+        let block_hash = block_header.hash_slow();
+        debug!("[SGX DEBUG] SGX computed hash: {:?}", sgx_hash);
+        debug!("[SGX DEBUG] Block header computed hash: {:?}", block_hash);
+        
         let sealed_block = reth::primitives::SealedBlock::seal_slow(block_with_senders);
+        
+        debug!("[SGX DEBUG] Final sealed block hash: {:?}", sealed_block.hash());
         
         self.block_trace.finalize_time = start_time.elapsed();
         
@@ -304,6 +338,19 @@ impl block_building_helper::BlockBuildingHelper for SgxWasmBlockBuildingHelper {
 use crate::utils::sgx_signature_verifier::BlockSignatureVerifier;
 use alloy_primitives::Sealable;
 use futures::TryFutureExt;
+use block_builder_types::*;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BlockBuilderInput {
+    block_params: BlockParams,
+    accounts: Vec<SerializedAccount>,
+    storage: Vec<SerializedStorage>,
+    code: Vec<SerializedCode>,
+    transactions: Vec<SerializedTransaction>,
+    bundles: Vec<SerializedBundle>,
+    withdrawals: Vec<SerializedWithdrawal>,
+    config: BlockBuilderConfig,
+}
 #[cfg(feature = "sgx_integration")]
 use sgx_wasm_runner::BlockBuilderSgx;
 use crate::live_builder::simulation::SimulatedOrderCommand;
@@ -328,268 +375,26 @@ pub struct SgxWasmBlockBuildingAlgorithm {
     fallback_to_native: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockBuilderInput {
-    block_params: BlockParams,
-    accounts: Vec<SerializedAccount>,
-    storage: Vec<SerializedStorage>,
-    code: Vec<SerializedCode>,
-    transactions: Vec<SerializedTransaction>,
-    bundles: Vec<SerializedBundle>,
-    config: BlockBuilderConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockParams {
-    number: u64,
-    timestamp: u64,
-    gas_limit: u64,
-    base_fee_per_gas: String,
-    coinbase: Address,
-    parent_hash: B256,
-    parent_state_root: B256,
-    withdrawals_root: Option<B256>,
-    blob_gas_used: Option<u64>,
-    excess_blob_gas: Option<u64>,
-    parent_beacon_block_root: Option<B256>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedAccount {
-    address: Address,
-    balance: alloy_primitives::U256,
-    nonce: u64,
-    code_hash: B256,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedStorage {
-    address: Address,
-    slot: B256,
-    value: B256,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedCode {
-    hash: B256,
-    bytecode: alloy_primitives::Bytes,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedTransaction {
-    hash: B256,
-    from: Address,
-    to: Option<Address>,
-    value: alloy_primitives::U256,
-    gas_limit: u64,
-    gas_price: Option<alloy_primitives::U256>,
-    nonce: u64,
-    input: alloy_primitives::Bytes,
-    tx_type: String,
-    access_list: Vec<AccessListItem>,
-    blob_hashes: Vec<B256>,
-    max_priority_fee_per_gas: Option<alloy_primitives::U256>,
-    max_fee_per_gas: Option<alloy_primitives::U256>,
-    max_fee_per_blob_gas: Option<alloy_primitives::U256>,
-    versioned_hashes: Vec<B256>,
-    encoded_signed_tx: alloy_primitives::Bytes,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct AccessListItem {
-    address: Address,
-    storage_keys: Vec<B256>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedBundle {
-    id: String,
-    transactions: Vec<SerializedTransaction>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockBuilderConfig {
-    discard_txs: bool,
-    sorting: String,
-    failed_tx_retries: u32,
-    drop_failed_txs: bool,
-    coinbase_payment: bool,
-    build_timeout_ms: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockBuilderOutput {
-    header: AlloyHeader,
-    transactions: Vec<alloy_primitives::Bytes>,
-    receipts: Vec<SerializedReceipt>,
-    state_diff: SerializedStateDiff,
-    state_root: Option<B256>,
-    metrics: BlockMetrics,
-    signature: Option<alloy_primitives::Bytes>,
-}
 
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedReceipt {
-    tx_type: u8,
-    success: bool,
-    cumulative_gas_used: u64,
-    logs: Vec<SerializedLog>,
-    #[serde(with = "serde_bytes_array")]
-    logs_bloom: [u8; 256],
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedLog {
-    address: Address,
-    topics: Vec<B256>,
-    data: alloy_primitives::Bytes,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedStateDiff {
-    accounts: Vec<SerializedAccountDiff>,
-    storage: Vec<SerializedStorageDiff>,
-    code: Vec<SerializedCodeDiff>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedAccountDiff {
-    address: Address,
-    old_balance: Option<alloy_primitives::U256>,
-    new_balance: Option<alloy_primitives::U256>,
-    old_nonce: Option<u64>,
-    new_nonce: Option<u64>,
-    old_code_hash: Option<B256>,
-    new_code_hash: Option<B256>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedStorageDiff {
-    address: Address,
-    slot: B256,
-    old_value: B256,
-    new_value: B256,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedCodeDiff {
-    hash: B256,
-    bytecode: alloy_primitives::Bytes,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct BlockMetrics {
-    tx_count: usize,
-    blob_count: usize,
-    gas_used: u64,
-    blob_gas_used: Option<u64>,
-    block_value: alloy_primitives::U256,
-    build_time_us: u64,
-    trace: Option<SerializedBuildTrace>,
-}
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SerializedBuildTrace {
-    sim_time_us: u64,
-    finalize_time_us: u64,
-    root_hash_time_us: u64,
-    ordering_time_us: u64,
-    orders_considered: usize,
-    orders_included: usize,
-    orders_failed: usize,
-}
 
-mod serde_bytes_array {
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-    use serde::de::{Error, Visitor};
-    use std::fmt;
-    use std::marker::PhantomData;
 
-    pub fn serialize<S, const N: usize>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        if serializer.is_human_readable() {
-            let hex = hex::encode(bytes);
-            serializer.serialize_str(&hex)
-        } else {
-            bytes.serialize(serializer)
-        }
-    }
 
-    pub fn deserialize<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct BytesVisitor<const N: usize>(PhantomData<[u8; N]>);
 
-        impl<'de, const N: usize> Visitor<'de> for BytesVisitor<N> {
-            type Value = [u8; N];
 
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "a byte array of length {}", N)
-            }
 
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                let bytes = hex::decode(v)
-                    .map_err(|_| Error::custom("invalid hex string"))?;
-                if bytes.len() != N {
-                    return Err(Error::custom(format!(
-                        "expected {} bytes, got {}",
-                        N,
-                        bytes.len()
-                    )));
-                }
-                let mut result = [0u8; N];
-                result.copy_from_slice(&bytes);
-                Ok(result)
-            }
 
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
-            where
-                E: Error,
-            {
-                if v.len() != N {
-                    return Err(Error::custom(format!(
-                        "expected {} bytes, got {}",
-                        N,
-                        v.len()
-                    )));
-                }
-                let mut result = [0u8; N];
-                result.copy_from_slice(v);
-                Ok(result)
-            }
 
-            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::SeqAccess<'de>,
-            {
-                let mut result = [0u8; N];
-                for i in 0..N {
-                    match seq.next_element()? {
-                        Some(v) => result[i] = v,
-                        None => return Err(Error::custom(format!(
-                "expected {} bytes, got {}",
-                N, i
-                        ))),
-                    }
-                }
-                Ok(result)
-            }
-        }
 
-        if deserializer.is_human_readable() {
-            deserializer.deserialize_str(BytesVisitor(PhantomData))
-        } else {
-            deserializer.deserialize_bytes(BytesVisitor(PhantomData))
-        }
-    }
-}
+
+
 
 impl SgxWasmBlockBuildingAlgorithm {
     pub fn new(wasm_path: PathBuf, fallback_to_native: bool) -> Result<Self> {
@@ -833,6 +638,8 @@ impl SgxWasmBlockBuildingAlgorithm {
                         bundles.push(SerializedBundle {
                 id: order_id,
                 transactions: bundle_transactions,
+                hash: bundle.hash,
+                revertible: !bundle.reverting_tx_hashes.is_empty(),
                         });
                     }
                 },
@@ -857,6 +664,8 @@ impl SgxWasmBlockBuildingAlgorithm {
                         bundles.push(SerializedBundle {
                 id: order_id,
                 transactions: bundle_transactions,
+                hash: share_bundle.hash,
+                revertible: share_bundle.inner_bundle().can_skip,
                         });
                     }
                 }
@@ -866,18 +675,9 @@ impl SgxWasmBlockBuildingAlgorithm {
         (transactions, bundles)
     }
     fn serialize_transaction(&self, tx: &reth_primitives::Transaction, sender: Address, hash: B256, encoded_signed_tx: alloy_primitives::Bytes) -> SerializedTransaction {
-        let tx_type = match tx.tx_type() {
-            alloy_consensus::TxType::Legacy => "Legacy",
-            alloy_consensus::TxType::Eip2930 => "AccessList",
-            alloy_consensus::TxType::Eip1559 => "EIP1559",
-            alloy_consensus::TxType::Eip4844 => "EIP4844",
-            _ => "Unknown",
-        };
+        let tx_type = tx.tx_type();
         let access_list = if let Some(al) = tx.access_list() {
-            al.0.iter().map(|item| AccessListItem {
-                address: item.address,
-                storage_keys: item.storage_keys.clone(),
-            }).collect()
+            al.0.clone()
         } else {
             Vec::new()
         };
@@ -890,7 +690,7 @@ impl SgxWasmBlockBuildingAlgorithm {
             gas_price: tx.gas_price().map(|gp| U256::from(gp)),
             nonce: tx.nonce(),
             input: tx.input().clone(),
-            tx_type: tx_type.to_string(),
+            tx_type,
             access_list,
             blob_hashes: Vec::new(),
             max_priority_fee_per_gas: tx.max_priority_fee_per_gas().map(|fee| U256::from(fee)),
@@ -901,28 +701,75 @@ impl SgxWasmBlockBuildingAlgorithm {
         }
     }
     fn convert_block_params(&self, ctx: &BlockBuildingContext) -> BlockParams {
+        let (blob_gas_used, excess_blob_gas) = if ctx.chain_spec.is_cancun_active_at_timestamp(ctx.attributes.timestamp) {
+            (Some(0), ctx.excess_blob_gas)
+        } else {
+            (None, None)
+        };
+
+        let withdrawals_root = if ctx.chain_spec.is_shanghai_active_at_timestamp(ctx.attributes.timestamp) {
+            use reth_basic_payload_builder::commit_withdrawals;
+            use revm::State;
+            use revm::db::EmptyDB;
+            
+            let mut db = State::builder()
+                .with_database(EmptyDB::default())
+                .with_bundle_update()
+                .build();
+                
+            match commit_withdrawals(
+                &mut db,
+                &ctx.chain_spec,
+                ctx.attributes.timestamp,
+                &ctx.attributes.withdrawals,
+            ) {
+                Ok(root) => {
+                    debug!("[SGX DEBUG] Computed withdrawals_root using commit_withdrawals: {:?}", root);
+                    root
+                },
+                Err(e) => {
+                    debug!("[SGX DEBUG] commit_withdrawals failed: {}, using empty root", e);
+                    Some(reth_trie::EMPTY_ROOT_HASH)
+                }
+            }
+        } else {
+            None
+        };
+
         BlockParams {
             number: ctx.evm_env.block_env.number.to::<u64>(),
             timestamp: ctx.attributes.timestamp,
             gas_limit: ctx.evm_env.block_env.gas_limit.to::<u64>(),
-            base_fee_per_gas: format!("0x{:x}", ctx.evm_env.block_env.basefee),
+            base_fee_per_gas: ctx.evm_env.block_env.basefee,
             coinbase: ctx.attributes.suggested_fee_recipient,
             parent_hash: ctx.attributes.parent,
             parent_state_root: B256::default(),
-            withdrawals_root: None,
-            blob_gas_used: None,
-            excess_blob_gas: None,
+            withdrawals_root,
+            blob_gas_used,
+            excess_blob_gas,
             parent_beacon_block_root: ctx.attributes.parent_beacon_block_root,
+            prev_randao: ctx.attributes.prev_randao,
         }
     }
+    fn convert_withdrawals(&self, ctx: &BlockBuildingContext) -> Vec<SerializedWithdrawal> {
+        if ctx.chain_spec.is_shanghai_active_at_timestamp(ctx.attributes.timestamp) {
+            ctx.attributes.withdrawals.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+
     fn create_config(&self, ctx: &BlockBuildingContext) -> BlockBuilderConfig {
         BlockBuilderConfig {
             discard_txs: true,
-            sorting: "MevGasPrice".to_string(),
+            sorting: block_builder_types::SortingAlgorithm::MevGasPrice,
             failed_tx_retries: 1,
             drop_failed_txs: true,
             coinbase_payment: !ctx.coinbase_is_suggested_fee_recipient(),
             build_timeout_ms: 10000,
+            complete_state_diff: false,
+            include_merkle_proofs: false,
+            compression_level: "medium".to_string(),
         }
     }
     fn convert_output_to_block(&self, output: BlockBuilderOutput, helper: &dyn BlockBuildingHelper, ctx: &BlockBuildingContext) -> Result<BiddableUnfinishedBlock> {
@@ -957,12 +804,12 @@ impl SgxWasmBlockBuildingAlgorithm {
             }
         }
         
-        for receipt_data in &output.receipts {
+        for (i, receipt_data) in output.receipts.iter().enumerate() {
             let mut logs = Vec::new();
             for log_data in &receipt_data.logs {
                 let reth_log_data = LogData::new_unchecked(
-                    log_data.topics.iter().map(|t| RethB256::from_slice(t.as_slice())).collect(), 
-                    RethBytes(log_data.data.0.clone())
+                    log_data.topics().iter().map(|t| RethB256::from_slice(t.as_slice())).collect(), 
+                    RethBytes(log_data.data.data.clone().into())
                 );
                 logs.push(RethLog {
                     address: RethAddress::from_slice(log_data.address.as_slice()),
@@ -970,15 +817,38 @@ impl SgxWasmBlockBuildingAlgorithm {
                 });
             }
             
-            let reth_tx_type = match receipt_data.tx_type {
-                0 => reth_primitives::TxType::Legacy,
-                1 => reth_primitives::TxType::Eip2930,
-                2 => reth_primitives::TxType::Eip1559,
-                3 => reth_primitives::TxType::Eip4844,
-                _ => {
-                    warn!("Unknown transaction type {} in SGX receipt, defaulting to Legacy", receipt_data.tx_type);
-                    reth_primitives::TxType::Legacy
+            let tx_type = if i < output.transactions.len() {
+                let tx_bytes = &output.transactions[i];
+                let mut tx_bytes_slice: &[u8] = &tx_bytes.0;
+                match TransactionSigned::decode(&mut tx_bytes_slice) {
+                    Ok(tx_signed_reth) => {
+                        match tx_signed_reth.tx_type() {
+                            reth_primitives::TxType::Legacy => alloy_consensus::TxType::Legacy,
+                            reth_primitives::TxType::Eip2930 => alloy_consensus::TxType::Eip2930,
+                            reth_primitives::TxType::Eip1559 => alloy_consensus::TxType::Eip1559,
+                            reth_primitives::TxType::Eip4844 => alloy_consensus::TxType::Eip4844,
+                            reth_primitives::TxType::Eip7702 => alloy_consensus::TxType::Eip7702,
+                        }
+                    },
+                    Err(_) => {
+                        warn!("Failed to decode transaction at index {} for receipt processing, using Legacy as fallback", i);
+                        alloy_consensus::TxType::Legacy
+                    }
                 }
+            } else {
+                warn!("Receipt index {} exceeds transaction list length {}, using Legacy as fallback", i, output.transactions.len());
+                alloy_consensus::TxType::Legacy
+            };
+            
+            let reth_tx_type = match tx_type {
+                alloy_consensus::TxType::Legacy => reth_primitives::TxType::Legacy,
+                alloy_consensus::TxType::Eip2930 => reth_primitives::TxType::Eip2930,
+                alloy_consensus::TxType::Eip1559 => reth_primitives::TxType::Eip1559,
+                alloy_consensus::TxType::Eip4844 => reth_primitives::TxType::Eip4844,
+                alloy_consensus::TxType::Eip7702 => {
+                    warn!("EIP-7702 transaction type encountered, treating as EIP-1559 for reth compatibility");
+                    reth_primitives::TxType::Eip1559
+                },
             };
             
             receipts_vec.push(RethReceipt {
@@ -1285,6 +1155,7 @@ where
                     code,
                     transactions: Vec::new(),
                     bundles: Vec::new(),
+                    withdrawals: owned_self.convert_withdrawals(&ctx),
                     config: owned_self.create_config(&ctx),
                 };
 
@@ -1449,9 +1320,9 @@ where
                                 Vec::new(),
                                 Vec::new(),
                                 Vec::new(),
-                                AlloyHeader {
+                                Header {
                                     parent_hash: B256::default(),
-                                    ommers_hash: EMPTY_ROOT_HASH,
+                                    ommers_hash: EMPTY_OMMER_ROOT_HASH,
                                     beneficiary: Address::default(),
                                     state_root: B256::default(),
                                     transactions_root: B256::default(),

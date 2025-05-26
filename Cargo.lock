@@ -1842,7 +1842,9 @@ dependencies = [
  "alloy-eips 0.11.1",
  "alloy-primitives 0.8.23",
  "alloy-rlp",
+ "alloy-rpc-types-eth 0.11.1",
  "hex",
+ "reth-primitives",
  "serde",
 ]
 
@@ -15920,10 +15922,10 @@ dependencies = [
  "lazy_static",
  "log",
  "rand_core 0.6.4",
+ "reth-primitives",
  "revm",
  "serde",
  "serde_json",
- "sha3",
  "thiserror 1.0.69",
  "tokio",
  "tracing-subscriber",

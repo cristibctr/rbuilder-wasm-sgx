@@ -691,7 +691,7 @@ fn process_calculate_state_root_internal(changes: &[u8], state: &[u8]) -> WasiRe
         base_state.code,
     );
 
-    let root = state::root::calculate_state_root(&state_changes, &state_provider)
+    let root = state::reth_compatible_root::calculate_state_root(&state_changes, &state_provider)
         .map_err(|e| WasiError::StateRoot(format!("State root calculation failed: {}", e)))?;
     
     Ok(root.0.to_vec())

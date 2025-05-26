@@ -1,5 +1,7 @@
-use alloy_primitives::{Address, Bytes, B256, U256};
-use alloy_consensus::Header;
+use alloy_primitives::{Address, Bytes, B256, U256, Log, Bloom};
+use alloy_consensus::{Header, TxType, Eip658Value};
+use alloy_eips::eip2930::AccessListItem;
+use alloy_eips::eip4895::Withdrawal;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "encoding")]
@@ -23,22 +25,9 @@ pub struct BlockBuilderOutput {
     pub execution_requests: Option<Vec<Bytes>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializedReceipt {
-    pub tx_type: u8,
-    pub success: bool,
-    pub cumulative_gas_used: u64,
-    pub logs: Vec<SerializedLog>,
-    #[serde(with = "serde_utils::serde_bytes_array")]
-    pub logs_bloom: [u8; 256],
-}
+pub type SerializedReceipt = reth_primitives::Receipt;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializedLog {
-    pub address: Address,
-    pub topics: Vec<B256>,
-    pub data: Bytes,
-}
+pub type SerializedLog = Log;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedStateDiff {
@@ -69,6 +58,8 @@ pub struct SerializedStorageDiff {
 }
 
 pub type StorageDiff = SerializedStorageDiff;
+
+pub type SerializedAccessListEntry = AccessListItem;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializedCodeDiff {
@@ -105,67 +96,166 @@ pub struct SerializedBuildTrace {
     pub orders_failed: usize,
 }
 
-#[cfg(feature = "encoding")]
-impl Typed2718 for SerializedReceipt {
-    fn ty(&self) -> u8 {
-        self.tx_type
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockParams {
+    pub number: u64,
+    pub timestamp: u64,
+    pub gas_limit: u64,
+    pub base_fee_per_gas: U256,
+    pub coinbase: Address,
+    pub parent_hash: B256,
+    pub parent_state_root: B256,
+    pub withdrawals_root: Option<B256>,
+    pub blob_gas_used: Option<u64>,
+    pub excess_blob_gas: Option<u64>,
+    pub parent_beacon_block_root: Option<B256>,
+    pub prev_randao: B256,
+}
+
+impl BlockParams {
+    pub fn to_header_template(&self) -> Header {
+        use alloy_consensus::constants::EMPTY_OMMER_ROOT_HASH;
+        use alloy_eips::merge::BEACON_NONCE;
+        use alloy_primitives::{FixedBytes, U256 as PrimU256};
+        
+        Header {
+            parent_hash: self.parent_hash,
+            ommers_hash: EMPTY_OMMER_ROOT_HASH,
+            beneficiary: self.coinbase,
+            state_root: self.parent_state_root,
+            transactions_root: B256::ZERO,
+            receipts_root: B256::ZERO,
+            logs_bloom: alloy_primitives::Bloom::ZERO,
+            difficulty: PrimU256::ZERO.into(),
+            number: self.number,
+            gas_limit: self.gas_limit.into(),
+            gas_used: 0u64.into(),
+            timestamp: self.timestamp,
+            extra_data: alloy_primitives::Bytes::default(),
+            mix_hash: self.prev_randao,
+            nonce: FixedBytes::from(BEACON_NONCE.to_be_bytes()),
+            base_fee_per_gas: Some(self.base_fee_per_gas.to::<u64>()),
+            withdrawals_root: self.withdrawals_root,
+            blob_gas_used: self.blob_gas_used.map(|v| v.into()),
+            excess_blob_gas: self.excess_blob_gas.map(|v| v.into()),
+            parent_beacon_block_root: self.parent_beacon_block_root,
+            requests_hash: None,
+        }
     }
 }
 
-#[cfg(feature = "encoding")]
-impl Encodable2718 for SerializedReceipt {
-    fn type_flag(&self) -> Option<u8> {
-        match self.tx_type {
-            0 => None,
-            ty => Some(ty),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedAccount {
+    pub address: Address,
+    pub balance: U256,
+    pub nonce: u64,
+    pub code_hash: B256,
+}
 
-    fn encode_2718_len(&self) -> usize {
-        let payload_len = self.encode_fields_len();
-        if self.tx_type == 0 {
-            payload_len
+impl SerializedAccount {
+    pub fn is_contract(&self) -> bool {
+        self.code_hash != alloy_consensus::constants::KECCAK_EMPTY
+    }
+    
+    pub fn is_empty(&self) -> bool {
+        self.balance.is_zero() && self.nonce == 0 && self.code_hash == alloy_consensus::constants::KECCAK_EMPTY
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedStorage {
+    pub address: Address,
+    pub slot: B256,
+    pub value: B256,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedCode {
+    pub hash: B256,
+    pub bytecode: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedTransaction {
+    pub hash: B256,
+    pub from: Address,
+    pub to: Option<Address>,
+    pub value: U256,
+    pub gas_limit: u64,
+    pub gas_price: Option<U256>,
+    pub nonce: u64,
+    pub input: Bytes,
+    pub tx_type: TxType,
+    pub access_list: Vec<SerializedAccessListEntry>,
+    pub blob_hashes: Vec<B256>,
+    pub max_priority_fee_per_gas: Option<U256>,
+    pub max_fee_per_gas: Option<U256>,
+    pub max_fee_per_blob_gas: Option<U256>,
+    pub versioned_hashes: Vec<B256>,
+    pub encoded_signed_tx: Bytes,
+}
+
+impl SerializedTransaction {
+    pub fn is_eip1559(&self) -> bool {
+        matches!(self.tx_type, TxType::Eip1559 | TxType::Eip4844 | TxType::Eip7702)
+    }
+    
+    pub fn is_blob_tx(&self) -> bool {
+        self.tx_type == TxType::Eip4844
+    }
+    
+    pub fn is_eip7702(&self) -> bool {
+        self.tx_type == TxType::Eip7702
+    }
+    
+    pub fn is_create(&self) -> bool {
+        self.to.is_none()
+    }
+    
+    pub fn effective_gas_price(&self, base_fee: U256) -> U256 {
+        if let Some(gas_price) = self.gas_price {
+            gas_price
+        } else if let (Some(max_fee), Some(priority_fee)) = (self.max_fee_per_gas, self.max_priority_fee_per_gas) {
+            (base_fee + priority_fee).min(max_fee)
         } else {
-            1 + payload_len
+            base_fee
         }
-    }
-
-    fn encode_2718(&self, out: &mut dyn BufMut) {
-        if self.tx_type != 0 {
-            out.put_u8(self.tx_type);
-        }
-        self.encode_fields(out);
     }
 }
 
-#[cfg(feature = "encoding")]
-impl SerializedReceipt {
-    fn encode_fields_len(&self) -> usize {
-        let status = if self.success { 1u8 } else { 0u8 };
-        status.length() + 
-        self.cumulative_gas_used.length() +
-        self.logs_bloom.length() +
-        self.logs.length()
-    }
-    
-    fn encode_fields(&self, out: &mut dyn BufMut) {
-        let status = if self.success { 1u8 } else { 0u8 };
-        status.encode(out);
-        self.cumulative_gas_used.encode(out);
-        self.logs_bloom.encode(out);
-        self.logs.encode(out);
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedBundle {
+    pub id: String,
+    pub transactions: Vec<SerializedTransaction>,
+    pub hash: B256,
+    pub revertible: bool,
 }
 
-#[cfg(feature = "encoding")]
-impl Encodable for SerializedLog {
-    fn encode(&self, out: &mut dyn BufMut) {
-        self.address.encode(out);
-        self.topics.encode(out);
-        self.data.encode(out);
-    }
-    
-    fn length(&self) -> usize {
-        self.address.length() + self.topics.length() + self.data.length()
-    }
+pub type SerializedWithdrawal = Withdrawal;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockBuilderConfig {
+    pub discard_txs: bool,
+    pub sorting: SortingAlgorithm,
+    pub failed_tx_retries: u32,
+    pub drop_failed_txs: bool,
+    pub coinbase_payment: bool,
+    pub build_timeout_ms: u64,
+    #[serde(default)]
+    pub complete_state_diff: bool,
+    #[serde(default)]
+    pub include_merkle_proofs: bool,
+    #[serde(default = "default_compression_level")]
+    pub compression_level: String,
+}
+
+fn default_compression_level() -> String {
+    "medium".to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SortingAlgorithm {
+    GasPrice,
+    Profit,
+    MevGasPrice,
 }

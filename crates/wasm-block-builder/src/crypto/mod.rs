@@ -1,7 +1,6 @@
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, keccak256};
 use ecdsa::signature::Signer;
 use k256::ecdsa::{SigningKey, Signature, VerifyingKey, signature::Verifier};
-use sha3::{Digest, Keccak256};
 use thiserror::Error;
 use std::sync::{Mutex, OnceLock};
 use rand_core::OsRng;
@@ -93,11 +92,9 @@ impl BlockSigner {
     }
 
     pub fn sign(&self, data: &[u8]) -> Result<Bytes> {
-        let mut hasher = Keccak256::new();
-        hasher.update(data);
-        let hash = hasher.finalize();
+        let hash = keccak256(data);
 
-        let signature: Signature = self.private_key.sign(&hash);
+        let signature: Signature = self.private_key.sign(hash.as_slice());
 
         Ok(Bytes::from(signature.to_bytes().to_vec()))
     }
@@ -108,14 +105,12 @@ impl BlockSigner {
 }
 
 pub fn verify_signature(data: &[u8], signature: &[u8], public_key: &VerifyingKey) -> Result<bool> {
-    let mut hasher = Keccak256::new();
-    hasher.update(data);
-    let hash = hasher.finalize();
+    let hash = keccak256(data);
 
     let sig = Signature::try_from(signature)
         .map_err(|e| CryptoError::VerificationError(format!("Invalid signature format: {}", e)))?;
 
-    let is_valid = public_key.verify(&hash, &sig).is_ok();
+    let is_valid = public_key.verify(hash.as_slice(), &sig).is_ok();
     
     Ok(is_valid)
 }

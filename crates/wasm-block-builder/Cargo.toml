@@ -23,6 +23,8 @@ alloy-consensus = { version = "0.11.1", default-features = false, features = ["s
 alloy-trie = {version = "0.7", default-features = false}
 alloy-eips = { version = "0.11.1", default-features = false }
 
+reth-primitives = { workspace = true, default-features = false, features = ["std", "secp256k1", "alloy-compat"] }
+
 revm = { workspace = true, features = [
     "memory_limit", # Important for constrained environments
     "serde", # Needed for state serialization if revm types are used directly
@@ -34,7 +36,6 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 k256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
 ecdsa = { version = "0.16", default-features = false }
-sha3 = { version = "0.10", default-features = false }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 
 log = { version = "0.4", default-features = false }

@@ -1,7 +1,6 @@
-use alloy_primitives::Bytes;
+use alloy_primitives::{Bytes, keccak256};
 use k256::ecdsa::{signature::Verifier, VerifyingKey, Signature};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Keccak256};
 use thiserror::Error;
 use block_builder_types::BlockBuilderOutput;
 
@@ -65,9 +64,7 @@ impl BlockSignatureVerifier {
         tracing::debug!("Serialized data: {}", String::from_utf8_lossy(&data_to_verify));
         
         tracing::debug!("Hashing data with Keccak256");
-        let mut hasher = Keccak256::new();
-        hasher.update(&data_to_verify);
-        let hash = hasher.finalize();
+        let hash = keccak256(&data_to_verify);
         tracing::debug!("Data hash: 0x{}", hex::encode(&hash));
         
         tracing::debug!("Parsing signature");
@@ -80,7 +77,7 @@ impl BlockSignatureVerifier {
         };
         
         tracing::debug!("Verifying signature with public key: {:?}", self.public_key);
-        let is_valid = self.public_key.verify(&hash, &sig).is_ok();
+        let is_valid = self.public_key.verify(hash.as_slice(), &sig).is_ok();
         
         if !is_valid {
             tracing::warn!("Signature verification failed for block output");
@@ -162,15 +159,13 @@ impl EnclaveKeyRegistry {
         let data_to_verify = serde_json::to_vec(&output)?;
         
         tracing::debug!("Hashing data with Keccak256");
-        let mut hasher = Keccak256::new();
-        hasher.update(&data_to_verify);
-        let hash = hasher.finalize();
+        let hash = keccak256(&data_to_verify);
         
         let sig = Signature::try_from(signature.as_ref())
             .map_err(|e| SignatureVerificationError::InvalidSignatureFormat(format!("Invalid signature format: {}", e)))?;
         
         for (name, key) in &self.keys {
-            if key.verify(&hash, &sig).is_ok() {
+            if key.verify(hash.as_slice(), &sig).is_ok() {
                 tracing::info!("Signature verified successfully with key: {}", name);
                 return Ok(true);
             }

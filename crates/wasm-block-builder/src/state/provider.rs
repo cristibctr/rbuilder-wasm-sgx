@@ -130,6 +130,30 @@ impl WasiStateProvider {
         self.block_hashes.get(&number).cloned()
     }
     
+    pub fn get_all_storage_addresses(&self) -> Vec<Address> {
+        let mut addresses: Vec<Address> = self.storage
+            .keys()
+            .map(|(address, _)| *address)
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        addresses.sort_by_key(|addr| alloy_primitives::keccak256(addr.as_slice()));
+        addresses
+    }
+    
+    pub fn get_storage_for_address(&self, address: Address) -> Vec<(B256, B256)> {
+        self.storage
+            .iter()
+            .filter_map(|((addr, slot), value)| {
+                if *addr == address {
+                    Some((*slot, *value))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+    
     pub fn get_storage_root(&self, address: &Address) -> Option<B256> {
         if let Some(account) = self.accounts.get(address) {
             let slots: Vec<(B256, B256)> = self.storage

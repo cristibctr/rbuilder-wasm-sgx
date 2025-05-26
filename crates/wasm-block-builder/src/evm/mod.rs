@@ -1,7 +1,8 @@
 mod inspector;
 mod tracer;
 
-use crate::interfaces::input::{BlockParams, SerializedTransaction, TxType};
+use crate::interfaces::input::{BlockParams, SerializedTransaction};
+use alloy_consensus::TxType;
 use crate::state::provider::{StateError, WasiStateProvider};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use log::{debug, error, info, warn};
@@ -100,30 +101,37 @@ fn to_revm_tx_env(tx: &SerializedTransaction, coinbase: Address) -> Result<TxEnv
     
     match tx.tx_type {
         TxType::Legacy => {
-            tx_env.gas_price = tx.gas_price;
+            tx_env.gas_price = tx.gas_price.unwrap_or_default();
         }
-        TxType::AccessList => {
-            tx_env.gas_price = tx.gas_price;
+        TxType::Eip2930 => {
+            tx_env.gas_price = tx.gas_price.unwrap_or_default();
             tx_env.access_list = convert_access_list(&tx.access_list);
         }
-        TxType::EIP1559 => {
+        TxType::Eip1559 => {
             if let Some(priority_fee) = tx.max_priority_fee_per_gas {
                 tx_env.gas_priority_fee = Some(priority_fee);
             }
-            tx_env.gas_price = tx.gas_price;
+            tx_env.gas_price = tx.gas_price.unwrap_or_default();
             tx_env.access_list = convert_access_list(&tx.access_list);
         }
-        TxType::Blob => {
+        TxType::Eip4844 => {
             if let Some(priority_fee) = tx.max_priority_fee_per_gas {
                 tx_env.gas_priority_fee = Some(priority_fee);
             }
-            tx_env.gas_price = tx.gas_price;
+            tx_env.gas_price = tx.gas_price.unwrap_or_default();
             tx_env.access_list = convert_access_list(&tx.access_list);
             
             if let Some(blob_fee) = tx.max_fee_per_blob_gas {
                 tx_env.blob_hashes = tx.blob_hashes.clone();
                 tx_env.max_fee_per_blob_gas = Some(blob_fee);
             }
+        }
+        TxType::Eip7702 => {
+            if let Some(priority_fee) = tx.max_priority_fee_per_gas {
+                tx_env.gas_priority_fee = Some(priority_fee);
+            }
+            tx_env.gas_price = tx.gas_price.unwrap_or_default();
+            tx_env.access_list = convert_access_list(&tx.access_list);
         }
     }
     
@@ -142,7 +150,7 @@ fn convert_access_list(access_list: &[crate::interfaces::input::SerializedAccess
     for entry in access_list {
         revm_access_list.push(revm::primitives::AccessListItem {
             address: entry.address,
-            storage_keys: entry.slots.clone(),
+            storage_keys: entry.storage_keys.clone(),
         });
     }
     revm_access_list
@@ -166,6 +174,7 @@ pub fn estimate_gas(
         blob_gas_used: None,
         excess_blob_gas: None,
         parent_beacon_block_root: None,
+        prev_randao: B256::ZERO,
     };
     
     let mut evm = configure_evm(&mut state_copy, &block_params);
@@ -212,7 +221,7 @@ pub fn execute_transaction(
     
     if let ExecutionResult::Success { gas_used, output, .. } = result {
         let blob_gas_used = match tx.tx_type {
-            TxType::Blob => tx.blob_hashes.len() as u64 * 131072,
+            TxType::Eip4844 => tx.blob_hashes.len() as u64 * 131072,
             _ => 0,
         };
         
@@ -220,13 +229,14 @@ pub fn execute_transaction(
         
         let gas_price = if let Some(priority_fee) = tx.max_priority_fee_per_gas {
             let base_plus_priority = block_params.base_fee_per_gas + priority_fee;
-            if base_plus_priority < tx.gas_price {
+            let tx_gas_price = tx.gas_price.unwrap_or_default();
+            if base_plus_priority < tx_gas_price {
                 base_plus_priority
             } else {
-                tx.gas_price
+                tx_gas_price
             }
         } else {
-            tx.gas_price
+            tx.gas_price.unwrap_or_default()
         };
         
         let coinbase_profit = gas_price * U256::from(gas_used);
@@ -278,7 +288,7 @@ pub fn execute_transaction_with_trace(
     
     if let ExecutionResult::Success { gas_used, output, .. } = result {
         let blob_gas_used = match tx.tx_type {
-            TxType::Blob => tx.blob_hashes.len() as u64 * 131072,
+            TxType::Eip4844 => tx.blob_hashes.len() as u64 * 131072,
             _ => 0,
         };
         
@@ -286,13 +296,14 @@ pub fn execute_transaction_with_trace(
         
         let gas_price = if let Some(priority_fee) = tx.max_priority_fee_per_gas {
             let base_plus_priority = block_params.base_fee_per_gas + priority_fee;
-            if base_plus_priority < tx.gas_price {
+            let tx_gas_price = tx.gas_price.unwrap_or_default();
+            if base_plus_priority < tx_gas_price {
                 base_plus_priority
             } else {
-                tx.gas_price
+                tx_gas_price
             }
         } else {
-            tx.gas_price
+            tx.gas_price.unwrap_or_default()
         };
         
         let coinbase_profit = gas_price * U256::from(gas_used);

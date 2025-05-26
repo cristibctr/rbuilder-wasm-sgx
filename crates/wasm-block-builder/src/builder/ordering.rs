@@ -55,6 +55,7 @@ impl WasiOrderSorter {
             blob_gas_used: None,
             excess_blob_gas: None,
             parent_beacon_block_root: None,
+            prev_randao: B256::ZERO,
         };
         
         Self { 
@@ -143,7 +144,7 @@ impl WasiOrderSorter {
                 self.block_params.base_fee_per_gas + priority_fee
             }
             None => {
-                tx.gas_price
+                tx.gas_price.unwrap_or_default()
             }
         };
         

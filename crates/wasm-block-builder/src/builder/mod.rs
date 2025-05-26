@@ -5,10 +5,11 @@ use crate::{interfaces::{
     input::{BlockBuilderConfig, BlockParams, SerializedBundle, SerializedTransaction},
     output::{BlockBuilderOutput, BlockMetrics, SerializedBuildTrace},
 }, sgx_log, state::WasiStateProvider};
-use alloy_consensus::Header;
+use alloy_consensus::{Header, TxReceipt};
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_consensus::proofs::{calculate_transaction_root, calculate_receipt_root};
-use alloy_eips::eip2718::Typed2718;
+use alloy_eips::eip2718::{Typed2718, Encodable2718};
+use alloy_rlp::{BufMut, Encodable};
 use std::time::Instant;
 use thiserror::Error;
 use crate::state::CompressionLevel;
@@ -18,6 +19,8 @@ pub use self::simulator::WasiSimulator;
 
 #[derive(Clone)]
 struct TxWrapper(Bytes);
+
+
 
 impl alloy_eips::eip2718::Typed2718 for TxWrapper {
     fn ty(&self) -> u8 {
@@ -176,13 +179,16 @@ impl WasiBlockBuilder {
         let receipts_root = if receipts.is_empty() {
             B256::ZERO
         } else {
-            calculate_receipt_root(&receipts)
+            let receipts_with_bloom: Vec<_> = receipts.iter().map(|receipt| {
+                receipt.with_bloom_ref()
+            }).collect();
+            calculate_receipt_root(&receipts_with_bloom)
         };
         
         let logs_bloom = self.calculate_logs_bloom(&receipts);
         
-        let state_root = crate::state::root::calculate_state_root(&state_diff, &self.state)
-            .unwrap_or(B256::ZERO);
+        let state_root = crate::state::reth_compatible_root::calculate_state_root(&state_diff, &self.state)
+            .map_err(|e| BlockBuilderError::Building(format!("Failed to calculate state root: {}", e)))?;
         
         let finalize_time = finalize_start.elapsed();
         
@@ -221,33 +227,15 @@ impl WasiBlockBuilder {
     }
     
     fn create_header(&self, gas_used: u64, transactions_root: B256, receipts_root: B256, state_root: B256, logs_bloom: [u8; 256]) -> Result<Header, BlockBuilderError> {
-        use alloy_consensus::constants::EMPTY_ROOT_HASH;
-        use alloy_eips::merge::BEACON_NONCE;
-        use alloy_primitives::FixedBytes;
+        let mut header = self.block_params.to_header_template();
         
-        Ok(Header {
-            parent_hash: self.block_params.parent_hash,
-            ommers_hash: EMPTY_ROOT_HASH,
-            beneficiary: self.block_params.coinbase,
-            state_root,
-            transactions_root,
-            receipts_root,
-            logs_bloom: alloy_primitives::Bloom::from_slice(&logs_bloom),
-            difficulty: U256::ZERO.into(),
-            number: self.block_params.number,
-            gas_limit: self.block_params.gas_limit.into(),
-            gas_used: gas_used.into(),
-            timestamp: self.block_params.timestamp,
-            extra_data: Bytes::default(),
-            mix_hash: B256::ZERO,
-            nonce: FixedBytes::from(BEACON_NONCE.to_be_bytes()),
-            base_fee_per_gas: Some(self.block_params.base_fee_per_gas.to::<u64>()),
-            withdrawals_root: self.block_params.withdrawals_root,
-            blob_gas_used: self.block_params.blob_gas_used.map(|v| v.into()),
-            excess_blob_gas: self.block_params.excess_blob_gas.map(|v| v.into()),
-            parent_beacon_block_root: self.block_params.parent_beacon_block_root,
-            requests_hash: None,
-        })
+        header.state_root = state_root;
+        header.transactions_root = transactions_root;
+        header.receipts_root = receipts_root;
+        header.logs_bloom = alloy_primitives::Bloom::from_slice(&logs_bloom);
+        header.gas_used = gas_used.into();
+        
+        Ok(header)
     }
     
 
@@ -260,7 +248,7 @@ impl WasiBlockBuilder {
             .map(|log| {
                 Log {
                     address: log.address,
-                    data: LogData::new_unchecked(log.topics.clone(), log.data.clone()),
+                    data: LogData::new_unchecked(log.topics().to_vec(), log.data.data.clone()),
                 }
             })
             .collect();
