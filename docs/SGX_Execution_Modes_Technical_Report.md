@@ -178,20 +178,21 @@ Ordering ONLY recognizes that **MEV protection requires transaction ordering con
 
 ### Trusted Side (SGX Enclave) - Minimal Responsibilities
 
-**Transaction Ordering Only (`wasm-block-builder/src/lib.rs:200-320`)**:
+**Pure Algorithmic Ordering Only (`wasm-block-builder/src/lib.rs:208-241`)**:
 ```rust
 pub extern "C" fn order_transactions(input_ptr: *const u8, input_len: usize,
                                      output_ptr: *mut u8, output_len_ptr: *mut usize) -> i32 {
-    // Create minimal state provider (no state needed for ordering)
-    let state_provider = WasiStateProvider::new(
-        Vec::new(), // No accounts needed for ordering
-        Vec::new(), // No storage needed for ordering
-        Vec::new(), // No code needed for ordering
-    );
-
-    // Order transactions based on metadata (gas price, coinbase profit)
-    let sorter = builder::ordering::WasiOrderSorter::new(MevGasPrice);
-    let ordered_transactions = sorter.sort_transactions(transactions, bundles, &mut state_copy)?;
+    // NO EVM execution needed - pure algorithmic sorting
+    // NO state provider needed - eliminates prediction problem entirely
+    
+    // Pure algorithmic sorting using pre-calculated values from host simulation
+    let sorter = WasiOrderSorter::new(SortingAlgorithm::MevGasPrice)
+        .with_base_fee(input_data.base_fee);
+    
+    let ordering_result = sorter.sort_orders(input_data.orders)?;
+    
+    // Extract ordered IDs from the ACTUAL sorted result (CRITICAL FIX)
+    let ordered_ids = ordering_result.ordered_ids;
 
     // Sign ordering decision for MEV protection proof
     let signer = crypto::BlockSigner::new()?;
@@ -199,13 +200,15 @@ pub extern "C" fn order_transactions(input_ptr: *const u8, input_len: usize,
 }
 ```
 
-**Input**: `SgxOrderingInput` with transaction metadata only:
-- Order IDs, types, gas prices, coinbase profit
-- **No state data required** - eliminates prediction problem
+**Input**: `SgxOrderingInput` with pre-calculated host simulation values:
+- Order IDs, types, gas prices, **pre-calculated coinbase profit**
+- **Pre-calculated gas usage from host REVM execution**
+- **No state data required** - eliminates prediction problem entirely
 
 **Output**: `SgxOrderingOutput` with signed ordering decision:
-- Ordered transaction IDs
-- Cryptographic signature proving fair ordering
+- **ACTUAL ordered transaction IDs** (CRITICAL: not original order)
+- Cryptographic signature proving fair algorithmic ordering
+- **Verifiable against host execution** through signature validation
 
 ### Untrusted Side (Host) - Complete Execution
 
@@ -217,9 +220,10 @@ pub extern "C" fn order_transactions(input_ptr: *const u8, input_len: usize,
 - Only transaction characteristics (gas price, profit, type)
 
 **Phase 2: Get SGX Ordering**
-- Call `sgx_builder.order_transactions()` with metadata
-- Receive signed ordering decision from SGX
-- **No state access in SGX enclave**
+- Call `sgx_builder.order_transactions()` with pre-calculated metadata
+- SGX performs **pure algorithmic sorting** (no REVM execution)
+- Receive **cryptographically signed** ordering decision from SGX
+- Host uses **actual SGX-determined order**, not original order
 
 **Phase 3: Host Execution with Complete State Access**
 ```rust
@@ -247,20 +251,25 @@ fn execute_sgx_ordered_transactions() -> Result<BiddableUnfinishedBlock> {
 
 ### Key Architectural Advantages
 
-**Eliminates Static State Prediction**:
-- Host uses full `StateProviderFactory` without prediction
-- Dynamic state access through proven Reth infrastructure
-- **No missing storage slots or accounts**
+**Eliminates EVM Execution in SGX**:
+- **No REVM execution needed** in SGX enclave
+- **Pure algorithmic sorting** using pre-calculated host values
+- **No state prediction problem** - SGX doesn't need any state data
 
 **Guaranteed State Root Correctness**:
-- Uses identical algorithms as Reth validation
-- Same Merkle Patricia Trie implementation
+- Host uses identical algorithms as Reth validation
+- Same Merkle Patricia Trie implementation with complete state access
 - **Identical state access = identical execution = identical state roots**
 
 **Performance Optimization**:
-- Leverages optimized Reth execution engine
-- No enclave memory constraints
-- Parallel execution opportunities
+- **SGX does minimal work** - only algorithmic sorting
+- Host leverages optimized Reth execution engine
+- No enclave memory constraints or complex state handling
+
+**Cryptographic Ordering Enforcement**:
+- **SGX signature** creates unforgeable commitment to fair ordering
+- **Network verifiers** can validate SGX signature against actual execution
+- **Host cannot deviate** from SGX ordering without detection
 
 ## Technical Comparison
 
@@ -285,10 +294,10 @@ SGX Complete Execution (Incomplete State) → Custom State Root → Block Output
 
 **Ordering ONLY**:
 ```
-Metadata Extraction → SGX Ordering Decision →
-Host Execution (Complete State) → Reth State Root → SGX Verification
-                  ↑
-              SOLUTION: Complete state access, no prediction
+Host REVM Simulation → Pre-calculated Values → SGX Pure Algorithmic Sorting →
+SGX Signed Ordering → Host Execution (SGX Order) → Reth State Root → Network Verification
+                                    ↑
+                    SOLUTION: No EVM in SGX, cryptographically enforced ordering
 ```
 
 ### Security Model
