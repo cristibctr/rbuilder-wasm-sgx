@@ -1407,7 +1407,7 @@ impl SgxWasmBlockBuildingAlgorithm {
         block_orders: &ValidatedOrderMap,
         ctx: &BlockBuildingContext,
     ) -> Result<SgxOrderingInput> {
-        info!("[Ordering-Only Mode] Preparing orders for SGX ordering");
+        info!("[Ordering-Only Mode] Preparing {} orders with pre-calculated SimValues for SGX MEV-protected ordering", block_orders.get_all_orders().len());
         
         let orders: Vec<OrderForOrdering> = block_orders.get_all_orders()
             .into_iter()
@@ -1436,7 +1436,11 @@ impl SgxWasmBlockBuildingAlgorithm {
             orders,
         };
 
-        debug!("[Ordering-Only Mode] Prepared {} orders for SGX ordering", input.orders.len());
+        info!("[Ordering-Only Mode] Prepared {} orders for SGX ordering - sample values:", input.orders.len());
+        for (i, order) in input.orders.iter().take(3).enumerate() {
+            debug!("[Ordering-Only Mode] Order #{}: id={}, type={}, profit={}, gas_used={}, mev_gas_price={}", 
+                i + 1, order.id, order.order_type, order.coinbase_profit, order.gas_used, order.gas_price);
+        }
         Ok(input)
     }
 
@@ -1478,7 +1482,12 @@ impl SgxWasmBlockBuildingAlgorithm {
                     timestamp: sgx_output.timestamp,
                 };
                 
-                info!("[Ordering-Only Mode] SGX ordered {} transactions with MEV protection", ordering_result.ordered_transactions.len());
+                info!("[Ordering-Only Mode] SGX completed MEV-protected ordering: {} transactions sorted", ordering_result.ordered_transactions.len());
+                
+                let original_order: Vec<String> = input.orders.iter().map(|o| o.id.clone()).collect();
+                let sgx_order = &ordering_result.ordered_transaction_ids;
+                let order_changed = original_order != *sgx_order;
+                info!("[Ordering-Only Mode] Order changed by SGX: {} (original != sorted)", order_changed);
                 Ok(ordering_result)
             },
             Err(e) => {

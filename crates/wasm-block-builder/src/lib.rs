@@ -200,89 +200,17 @@ fn process_order_transactions_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
     let input_data = deserialize_ordering_input(input)
         .map_err(|e| WasiError::InputDeserialization(format!("Failed to deserialize OrderingInput: {}", e)))?;
     
-    let log_message = format!("Starting transaction ordering for block {}", input_data.block_number);
+    let log_message = format!("[SGX ORDERING] Starting MEV-protected ordering for block {} with {} orders", 
+        input_data.block_number, input_data.orders.len());
     log::info!("{}", log_message);
     sgx_log(&log_message);
     
-    let state_provider = WasiStateProvider::new(
-        Vec::new(), 
-        Vec::new(), 
-        Vec::new(), 
-    );
-    
-    let block_params = interfaces::input::BlockParams {
-        number: input_data.block_number,
-        timestamp: input_data.block_timestamp,
-        gas_limit: input_data.gas_limit,
-        base_fee_per_gas: input_data.base_fee,
-        coinbase: alloy_primitives::Address::ZERO,
-        parent_hash: alloy_primitives::B256::ZERO,
-        parent_state_root: alloy_primitives::B256::ZERO,
-        withdrawals_root: None,
-        blob_gas_used: None,
-        excess_blob_gas: None,
-        parent_beacon_block_root: None,
-        prev_randao: alloy_primitives::B256::ZERO,
-    };
-    
-    let transactions: Vec<interfaces::input::SerializedTransaction> = input_data.orders
-        .iter()
-        .filter(|order| order.order_type == "transaction")
-        .map(|order| interfaces::input::SerializedTransaction {
-            hash: {
-                let decoded = hex::decode(&order.order_hash).unwrap_or_else(|_| vec![0u8; 32]);
-                if decoded.len() >= 32 {
-                    alloy_primitives::B256::from_slice(&decoded[..32])
-                } else {
-                    alloy_primitives::B256::ZERO
-                }
-            },
-            from: alloy_primitives::Address::ZERO, 
-            to: None,
-            value: alloy_primitives::U256::ZERO,
-            gas_limit: order.gas_used,
-            gas_price: Some(order.gas_price),
-            nonce: 0,
-            input: alloy_primitives::Bytes::default(),
-            tx_type: alloy_consensus::TxType::Legacy,
-            access_list: Vec::new(),
-            blob_hashes: Vec::new(),
-            max_priority_fee_per_gas: Some(order.gas_price),
-            max_fee_per_gas: Some(order.gas_price),
-            max_fee_per_blob_gas: None,
-            versioned_hashes: Vec::new(),
-            encoded_signed_tx: alloy_primitives::Bytes::default(),
-        })
-        .collect();
-    
-    let bundles: Vec<interfaces::input::SerializedBundle> = input_data.orders
-        .iter()
-        .filter(|order| order.order_type == "bundle" || order.order_type == "share_bundle")
-        .map(|order| interfaces::input::SerializedBundle {
-            id: order.id.clone(),
-            transactions: vec![], 
-            hash: {
-                let decoded = hex::decode(&order.order_hash).unwrap_or_else(|_| vec![0u8; 32]);
-                if decoded.len() >= 32 {
-                    alloy_primitives::B256::from_slice(&decoded[..32])
-                } else {
-                    alloy_primitives::B256::ZERO
-                }
-            },
-            revertible: false, 
-        })
-        .collect();
-    
     let sorter = builder::ordering::WasiOrderSorter::new(block_builder_types::SortingAlgorithm::MevGasPrice)
-        .with_block_params(block_params);
+        .with_base_fee(input_data.base_fee);
     
-    let mut state_copy = state_provider;
-    let ordered_transactions = sorter.sort_transactions(transactions, bundles, &mut state_copy)?;
+    let ordering_result = sorter.sort_orders(input_data.orders)?;
     
-    let ordered_ids: Vec<String> = input_data.orders
-        .iter()
-        .map(|order| order.id.clone())  
-        .collect();
+    let ordered_ids = ordering_result.ordered_ids;
     
     let mut output_data = block_builder_types::SgxOrderingOutput {
         ordered_transaction_ids: ordered_ids,
@@ -291,11 +219,19 @@ fn process_order_transactions_internal(input: &[u8]) -> WasiResult<Vec<u8>> {
         signature: None,
     };
     
-    let log_message = format!("Completed ordering {} transactions", ordered_transactions.len());
+    let log_message = format!("[SGX ORDERING] Completed MEV-protected ordering: {} transactions sorted by {:?}", 
+        ordering_result.ordered_transactions.len(), block_builder_types::SortingAlgorithm::MevGasPrice);
     log::info!("{}", log_message);
     sgx_log(&log_message);
     
-    let sign_message = format!("Signing transaction ordering for block {}", output_data.block_number);
+    for (i, tx) in ordering_result.ordered_transactions.iter().take(3).enumerate() {
+        let log_msg = format!("[SGX ORDERING] #{}: id={}, profit={}, mev_gas_price={}", 
+            i + 1, tx.id, tx.coinbase_profit, tx.mev_gas_price);
+        log::debug!("{}", log_msg);
+        sgx_log(&log_msg);
+    }
+    
+    let sign_message = format!("[SGX ORDERING] Signing MEV-protected ordering for block {}", output_data.block_number);
     log::info!("{}", sign_message);
     sgx_log(&sign_message);
 

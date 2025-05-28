@@ -3,7 +3,7 @@ use crate::{
     interfaces::input::{BlockParams, SerializedBundle, SerializedTransaction},
     state::WasiStateProvider,
 };
-use block_builder_types::SortingAlgorithm;
+use block_builder_types::{SortingAlgorithm, OrderForOrdering};
 use alloy_primitives::{Address, B256, U256};
 use super::BlockBuilderError;
 use log::{debug, info};
@@ -11,63 +11,123 @@ use log::{debug, info};
 #[derive(Debug, Clone)]
 pub struct OrderedTransaction {
     pub transaction: SerializedTransaction,
-    
     pub priority: OrderPriority,
-    
     pub in_bundle: bool,
-    
     pub bundle_hash: Option<B256>,
-    
     pub simulated_gas_used: Option<u64>,
-    
     pub simulated_profit: Option<U256>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderedTransactionMeta {
+    pub id: String,
+    pub order_type: String,
+    pub priority: OrderPriority,
+    pub coinbase_profit: U256,
+    pub gas_used: u64,
+    pub mev_gas_price: U256,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrderingResult {
+    pub ordered_ids: Vec<String>,
+    pub ordered_transactions: Vec<OrderedTransactionMeta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum OrderPriority {
     GasPrice(U256),
-    
     Profit(U256),
-    
     MevGasPrice(U256),
-    
     BundleLength(usize, U256),
-    
     BundleFirst(bool, U256),
 }
 
 pub struct WasiOrderSorter {
     algorithm: SortingAlgorithm,
-    
-    block_params: BlockParams,
+    base_fee: U256,
+    block_params: Option<BlockParams>,
 }
 
 impl WasiOrderSorter {
     pub fn new(algorithm: SortingAlgorithm) -> Self {
-        let block_params = BlockParams {
-            number: 1,
-            timestamp: 1,
-            gas_limit: 30_000_000,
-            base_fee_per_gas: U256::from(1_000_000_000),
-            coinbase: Address::ZERO,
-            parent_hash: B256::ZERO,
-            parent_state_root: B256::ZERO,
-            withdrawals_root: None,
-            blob_gas_used: None,
-            excess_blob_gas: None,
-            parent_beacon_block_root: None,
-            prev_randao: B256::ZERO,
-        };
-        
         Self { 
             algorithm,
-            block_params,
+            base_fee: U256::from(1_000_000_000),
+            block_params: None,
         }
     }
     
-    pub fn with_block_params(mut self, block_params: BlockParams) -> Self {
-        self.block_params = block_params;
+    pub fn with_base_fee(mut self, base_fee: U256) -> Self {
+        self.base_fee = base_fee;
         self
+    }
+    
+    pub fn with_block_params(mut self, block_params: BlockParams) -> Self {
+        self.base_fee = block_params.base_fee_per_gas;
+        self.block_params = Some(block_params);
+        self
+    }
+    
+    pub fn sort_orders(
+        &self,
+        orders: Vec<OrderForOrdering>,
+    ) -> Result<OrderingResult, BlockBuilderError> {
+        info!("SGX performing pure algorithmic ordering of {} orders using {:?}", orders.len(), self.algorithm);
+        
+        let mut ordered_txs: Vec<OrderedTransactionMeta> = orders
+            .into_iter()
+            .map(|order| {
+                let priority = self.calculate_priority_from_precalc(&order);
+                OrderedTransactionMeta {
+                    id: order.id,
+                    order_type: order.order_type,
+                    priority,
+                    coinbase_profit: order.coinbase_profit,
+                    gas_used: order.gas_used,
+                    mev_gas_price: if order.gas_used > 0 {
+                        order.coinbase_profit / U256::from(order.gas_used)
+                    } else {
+                        U256::ZERO
+                    },
+                }
+            })
+            .collect();
+        
+        ordered_txs.sort_by(|a, b| b.priority.cmp(&a.priority));
+        
+        info!("SGX completed ordering: algorithm={:?}, total_orders={}", self.algorithm, ordered_txs.len());
+        
+        for (i, tx) in ordered_txs.iter().take(5).enumerate() {
+            debug!("SGX ordered #{}: id={}, priority={:?}, profit={}, gas={}", 
+                i + 1, tx.id, tx.priority, tx.coinbase_profit, tx.gas_used);
+        }
+        
+        let ordered_ids = ordered_txs.iter().map(|tx| tx.id.clone()).collect();
+        
+        Ok(OrderingResult {
+            ordered_ids,
+            ordered_transactions: ordered_txs,
+        })
+    }
+    
+    fn calculate_priority_from_precalc(&self, order: &OrderForOrdering) -> OrderPriority {
+        match self.algorithm {
+            SortingAlgorithm::GasPrice => {
+                OrderPriority::GasPrice(order.gas_price)
+            }
+            SortingAlgorithm::Profit => {
+                OrderPriority::Profit(order.coinbase_profit)
+            }
+            SortingAlgorithm::MevGasPrice => {
+                let mev_gas_price = if order.gas_used > 0 {
+                    order.coinbase_profit / U256::from(order.gas_used)
+                } else {
+                    U256::ZERO
+                };
+                OrderPriority::MevGasPrice(mev_gas_price)
+            }
+        }
     }
     
     pub fn sort_transactions(
@@ -78,8 +138,24 @@ impl WasiOrderSorter {
     ) -> Result<Vec<OrderedTransaction>, BlockBuilderError> {
         let mut ordered_txs = Vec::new();
         
+        let default_block_params = BlockParams {
+            number: 1,
+            timestamp: 1,
+            gas_limit: 30_000_000,
+            base_fee_per_gas: self.base_fee,
+            coinbase: Address::ZERO,
+            parent_hash: B256::ZERO,
+            parent_state_root: B256::ZERO,
+            withdrawals_root: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            parent_beacon_block_root: None,
+            prev_randao: B256::ZERO,
+        };
+        let block_params = self.block_params.as_ref().unwrap_or(&default_block_params);
+        
         for tx in transactions {
-            let (priority, gas_used, profit) = self.calculate_priority(&tx, state)?;
+            let (priority, gas_used, profit) = self.calculate_priority(&tx, state, block_params)?;
             ordered_txs.push(OrderedTransaction {
                 transaction: tx,
                 priority,
@@ -98,35 +174,29 @@ impl WasiOrderSorter {
             let mut any_failed = false;
             
             for tx in &bundle.transactions {
-                let (_, _, profit) = self.calculate_priority(tx, state)?;
-                if let Some(p) = profit {
-                    total_profit += p;
-                } else {
-                    any_failed = true;
-                    break;
+                match self.calculate_priority(tx, state, block_params) {
+                    Ok((priority, gas_used, profit)) => {
+                        if let Some(profit_val) = profit {
+                            total_profit += profit_val;
+                        }
+                        ordered_txs.push(OrderedTransaction {
+                            transaction: tx.clone(),
+                            priority,
+                            in_bundle: is_bundle,
+                            bundle_hash: Some(bundle.hash),
+                            simulated_gas_used: gas_used,
+                            simulated_profit: profit,
+                        });
+                    }
+                    Err(_) => {
+                        any_failed = true;
+                        break;
+                    }
                 }
             }
             
-            if any_failed && !bundle.revertible {
-                debug!("Skipping bundle that failed in simulation: {:?}", bundle.hash);
-                continue;
-            }
-            
-            for tx in bundle.transactions {
-                let (mut priority, gas_used, profit) = self.calculate_priority(&tx, state)?;
-                
-                if self.algorithm == SortingAlgorithm::Profit {
-                    priority = OrderPriority::BundleFirst(is_bundle, total_profit);
-                }
-                
-                ordered_txs.push(OrderedTransaction {
-                    transaction: tx,
-                    priority,
-                    in_bundle: true,
-                    bundle_hash: Some(bundle.hash),
-                    simulated_gas_used: gas_used,
-                    simulated_profit: profit,
-                });
+            if any_failed {
+                ordered_txs.retain(|tx| tx.bundle_hash != Some(bundle.hash));
             }
         }
         
@@ -139,10 +209,11 @@ impl WasiOrderSorter {
         &self, 
         tx: &SerializedTransaction,
         state: &mut WasiStateProvider,
+        block_params: &BlockParams,
     ) -> Result<(OrderPriority, Option<u64>, Option<U256>), BlockBuilderError> {
         let gas_price = match tx.max_priority_fee_per_gas {
             Some(priority_fee) => {
-                self.block_params.base_fee_per_gas + priority_fee
+                block_params.base_fee_per_gas + priority_fee
             }
             None => {
                 tx.gas_price.unwrap_or_default()
@@ -158,7 +229,7 @@ impl WasiOrderSorter {
                 
                 let mut state_copy = state.clone();
                 
-                match evm::execute_transaction(tx, &mut state_copy, &self.block_params) {
+                match evm::execute_transaction(tx, &mut state_copy, block_params) {
                     Ok(result) => {
                         let gas_used = result.gas_used;
                         let profit = result.coinbase_profit;
