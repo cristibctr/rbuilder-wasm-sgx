@@ -1367,6 +1367,19 @@ impl SgxWasmBlockBuildingAlgorithm {
             }
         };
 
+        info!("[Ordering-Only Mode] Phase 4: Verifying SGX signature on ordering decision");
+        match self.verify_sgx_ordering_signature(&ordering_result) {
+            Ok(_) => {
+                info!("[Ordering-Only Mode] SGX ordering signature verified - MEV protection confirmed");
+            },
+            Err(e) => {
+                error!("[Ordering-Only Mode] SGX ordering signature verification failed: {}", e);
+                if self.fallback_to_native {
+                    warn!("[Ordering-Only Mode] Proceeding without SGX verification due to signature failure");
+                }
+            }
+        }
+
         info!("[Ordering-Only Mode] Phase 3: Executing SGX-ordered transactions with full Reth infrastructure");
         let final_block = match self.execute_sgx_ordered_transactions(
             &ordering_result, block_orders, ctx, provider, state_provider, name
@@ -1385,21 +1398,7 @@ impl SgxWasmBlockBuildingAlgorithm {
                 }
             }
         };
-
-        info!("[Ordering-Only Mode] Phase 4: Verifying SGX signature on ordering decision");
-        match self.verify_sgx_ordering_signature(&ordering_result) {
-            Ok(_) => {
-                info!("[Ordering-Only Mode] SGX ordering signature verified - MEV protection confirmed");
-                sink.new_block(final_block);
-            },
-            Err(e) => {
-                error!("[Ordering-Only Mode] SGX ordering signature verification failed: {}", e);
-                if self.fallback_to_native {
-                    warn!("[Ordering-Only Mode] Proceeding without SGX verification due to signature failure");
-                    sink.new_block(final_block);
-                }
-            }
-        }
+        sink.new_block(final_block);
     }
 
     fn prepare_sgx_ordering_input(
