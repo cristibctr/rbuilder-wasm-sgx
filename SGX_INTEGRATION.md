@@ -122,6 +122,8 @@ ls -la crates/wasm-micro-runtime/product-mini/platforms/linux-sgx/enclave-sample
 
 ### Integration Test
 
+Run [builder-playground](https://github.com/flashbots/builder-playground).
+
 Run the SGX integration test to verify everything is working:
 
 ```bash
