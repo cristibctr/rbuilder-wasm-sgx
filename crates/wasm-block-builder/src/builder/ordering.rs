@@ -75,7 +75,7 @@ impl WasiOrderSorter {
     ) -> Result<OrderingResult, BlockBuilderError> {
         info!("SGX performing pure algorithmic ordering of {} orders using {:?}", orders.len(), self.algorithm);
         
-        let mut ordered_txs: Vec<OrderedTransactionMeta> = orders
+        let mut ordered_txs: Vec<OrderedTransactionMeta> = orders.clone()
             .into_iter()
             .map(|order| {
                 let priority = self.calculate_priority_from_precalc(&order);
@@ -93,8 +93,8 @@ impl WasiOrderSorter {
                 }
             })
             .collect();
-        
-        ordered_txs.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        ordered_txs = self.sort_with_nonce_constraints(ordered_txs, &orders)?;
         
         info!("SGX completed ordering: algorithm={:?}, total_orders={}", self.algorithm, ordered_txs.len());
         
@@ -128,6 +128,73 @@ impl WasiOrderSorter {
                 OrderPriority::MevGasPrice(mev_gas_price)
             }
         }
+    }
+    
+    fn sort_with_nonce_constraints(
+        &self,
+        mut transactions: Vec<OrderedTransactionMeta>,
+        original_orders: &[OrderForOrdering],
+    ) -> Result<Vec<OrderedTransactionMeta>, BlockBuilderError> {
+        use std::collections::HashMap;
+
+        let mut nonce_info: HashMap<String, (Address, u64)> = HashMap::new();
+        for order in original_orders {
+            if let (Some(from_address), Some(nonce)) = (order.from_address, order.nonce) {
+                nonce_info.insert(order.id.clone(), (from_address, nonce));
+            }
+        }
+
+        let mut account_txs: HashMap<Address, Vec<OrderedTransactionMeta>> = HashMap::new();
+        let mut other_txs = Vec::new();
+        
+        for tx in transactions {
+            if let Some((address, _)) = nonce_info.get(&tx.id) {
+                account_txs.entry(*address).or_insert_with(Vec::new).push(tx);
+            } else {
+                other_txs.push(tx);
+            }
+        }
+
+        for (address, txs) in account_txs.iter_mut() {
+            txs.sort_by(|a, b| {
+                let nonce_a = nonce_info.get(&a.id).map(|(_, n)| *n).unwrap_or(0);
+                let nonce_b = nonce_info.get(&b.id).map(|(_, n)| *n).unwrap_or(0);
+                nonce_a.cmp(&nonce_b)
+            });
+        }
+
+        let mut result = Vec::new();
+        let mut account_indices: HashMap<Address, usize> = HashMap::new();
+
+        other_txs.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        let mut all_account_txs: Vec<(Address, &OrderedTransactionMeta)> = Vec::new();
+        for (address, txs) in &account_txs {
+            for tx in txs {
+                all_account_txs.push((*address, tx));
+            }
+        }
+
+        all_account_txs.sort_by(|a, b| b.1.priority.cmp(&a.1.priority));
+
+        let mut processed_accounts = std::collections::HashSet::new();
+        
+        for (address, _) in all_account_txs {
+            if processed_accounts.contains(&address) {
+                continue;
+            }
+            
+            if let Some(txs) = account_txs.get(&address) {
+                result.extend(txs.iter().cloned());
+                processed_accounts.insert(address);
+            }
+        }
+
+        result.extend(other_txs);
+        
+        info!("SGX nonce-aware ordering: processed {} transactions with nonce constraints", result.len());
+        
+        Ok(result)
     }
     
     pub fn sort_transactions(

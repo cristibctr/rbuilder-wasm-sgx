@@ -290,6 +290,8 @@ pub struct OrderForOrdering {
     pub gas_used: u64,
     pub gas_price: U256,
     pub order_hash: String,
+    pub from_address: Option<Address>,
+    pub nonce: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

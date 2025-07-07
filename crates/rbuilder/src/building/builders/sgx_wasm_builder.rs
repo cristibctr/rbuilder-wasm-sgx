@@ -1412,6 +1412,23 @@ impl SgxWasmBlockBuildingAlgorithm {
             .into_iter()
             .map(|sim_order| {
                 let order_id = sim_order.id().to_string();
+                let (from_address, nonce) = match &sim_order.order {
+                    crate::primitives::Order::Tx(tx) => (Some(tx.tx_with_blobs.signer()), Some(tx.tx_with_blobs.nonce())),
+                    crate::primitives::Order::Bundle(bundle) => {
+                        if let Some(first_tx) = bundle.txs.first() {
+                            (Some(first_tx.signer()), Some(first_tx.nonce()))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                    crate::primitives::Order::ShareBundle(share_bundle) => {
+                        if let Some(first_tx) = share_bundle.list_txs().first() {
+                            (Some(first_tx.0.signer()), Some(first_tx.0.nonce()))
+                        } else {
+                            (None, None)
+                        }
+                    }
+                };
                 OrderForOrdering {
                     id: order_id.clone(),
                     order_type: match &sim_order.order {
@@ -1423,6 +1440,8 @@ impl SgxWasmBlockBuildingAlgorithm {
                     gas_used: sim_order.sim_value.gas_used,
                     gas_price: sim_order.sim_value.mev_gas_price,
                     order_hash: order_id,
+                    from_address,
+                    nonce,
                 }
             })
             .collect();

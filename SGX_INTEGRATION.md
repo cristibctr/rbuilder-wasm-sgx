@@ -134,6 +134,22 @@ RUSTFLAGS=-Awarnings \
 cargo test --package rbuilder --lib integration::simple::tests::test_simple_example --features sgx_integration -- --nocapture
 ```
 
+#### Test Modes
+
+The integration test supports two transaction modes that can be configured by editing the `USE_MULTIPLE_ACCOUNTS` flag in `crates/rbuilder/src/integration/simple.rs`:
+
+- **Single Account Mode** (`USE_MULTIPLE_ACCOUNTS = false`): Tests with multiple transactions from the same account using different nonces (original behavior)
+- **Multiple Accounts Mode** (`USE_MULTIPLE_ACCOUNTS = true`): Tests with multiple accounts, each sending 2-3 transactions
+
+To switch between modes, modify the constant in the test file:
+
+```rust
+// In crates/rbuilder/src/integration/simple.rs
+const USE_MULTIPLE_ACCOUNTS: bool = true;  // or false
+```
+
+Multiple accounts mode provides better testing coverage for transaction ordering scenarios with different senders and helps verify SGX enclave behavior with diverse transaction patterns.
+
 ### SGX WASM Runner Example
 
 Test the SGX runner directly:
